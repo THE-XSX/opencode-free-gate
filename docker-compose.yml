@@ -1,8 +1,7 @@
-version: '3.8'
-
 services:
   opencode-free-gate:
-    image: ghcr.io/guji08233/opencode-free-gate:latest
+    build: .
+    image: opencode-free-gate:latest
     container_name: opencode-free-gate
     restart: unless-stopped
     ports:
