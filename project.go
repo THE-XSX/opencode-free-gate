@@ -63,5 +63,8 @@ func currentProject() projectSpec {
 		modelMode:             modelOpenCode,
 		ownedBy:               "opencode",
 		extraModels:           []string{"big-pickle"},
+		specialModels: map[string]string{
+			"muse-spark-1.3-contributor-free": "muse-spark-1.3-contributor",
+		},
 	}
 }

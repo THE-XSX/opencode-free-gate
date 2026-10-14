@@ -67,13 +67,14 @@ type gateway struct {
 	slots      []slot
 	custom     []slot
 
-	fillMu        sync.Mutex
-	refreshMu     sync.Mutex
-	refillRunning atomic.Bool
-	rr            atomic.Uint64
-	rootContext   context.Context
-	modelMu       sync.Mutex
-	modelCache    *cachedModels
+	fillMu          sync.Mutex
+	refreshMu       sync.Mutex
+	refillRunning   atomic.Bool
+	rr              atomic.Uint64
+	rootContext     context.Context
+	modelMu         sync.Mutex
+	modelCache      *cachedModels
+	responsesModels sync.Map
 }
 
 func newGateway(cfg config) *gateway {
@@ -505,10 +506,12 @@ type upstreamRequest struct {
 }
 
 type gatewayResponse struct {
-	status int
-	header http.Header
-	body   []byte
-	live   *liveResponse
+	status          int
+	header          http.Header
+	body            []byte
+	live            *liveResponse
+	responsesBridge bool
+	bridgeModel     string
 }
 
 type liveResponse struct {
@@ -785,7 +788,9 @@ func (g *gateway) dispatchPublicLayer(ctx context.Context, request upstreamReque
 			return response, nil
 		}
 		log.Printf("[错码] %s 状态码 %d", candidate.addr, response.status)
-		g.dropSlot(candidate.addr)
+		if shouldDropSlot(response.status, response.body) {
+			g.dropSlot(candidate.addr)
+		}
 		last = response
 		lastProxy = candidate.addr
 	}
@@ -927,6 +932,26 @@ func (g *gateway) customCount() int {
 	return len(g.custom)
 }
 
+// shouldUseResponses 判断模型是否需要走 /v1/responses 协议（优先查自动学习的内存表，其次查已知前缀）
+func (g *gateway) shouldUseResponses(model string) bool {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	if lower == "" {
+		return false
+	}
+	if _, ok := g.responsesModels.Load(lower); ok {
+		return true
+	}
+	return strings.Contains(lower, "muse-spark")
+}
+
+// markResponsesModel 将探测到不支持 Chat 协议的模型永久记入内存
+func (g *gateway) markResponsesModel(model string) {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	if lower != "" {
+		g.responsesModels.Store(lower, struct{}{})
+	}
+}
+
 func requestBudgetError(ctx context.Context, deadline time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -946,6 +971,14 @@ func retryableStatus(status int) bool {
 		return true
 	}
 	return status >= 500 && status <= 599
+}
+
+// shouldDropSlot 当上游返回包含明确业务 error JSON 的 500 时（模型自身偶发异常而非代理故障），保留健康代理槽位。
+func shouldDropSlot(status int, body []byte) bool {
+	if status == http.StatusInternalServerError && len(body) > 0 && bytes.Contains(body, []byte(`"error"`)) {
+		return false
+	}
+	return retryableStatus(status)
 }
 
 func jsonGatewayResponse(status int, message string) *gatewayResponse {

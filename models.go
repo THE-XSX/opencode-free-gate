@@ -23,13 +23,38 @@ type cachedModels struct {
 
 func (g *gateway) modelMaps(ctx context.Context) (map[string]string, map[string]string) {
 	g.modelMu.Lock()
+	cached := g.modelCache
+	if cached != nil && time.Since(cached.loadedAt) < modelCacheTTL {
+		rename := cloneStringMap(cached.rename)
+		redirect := cloneStringMap(cached.redirect)
+		g.modelMu.Unlock()
+		return rename, redirect
+	}
+	// 已有缓存过期时先返回旧缓存并在后台异步刷新，避免并发请求在互斥锁处排队等待 8 秒
+	if cached != nil {
+		cached.loadedAt = time.Now().Add(-(modelCacheTTL - 10*time.Second))
+		rename := cloneStringMap(cached.rename)
+		redirect := cloneStringMap(cached.redirect)
+		g.modelMu.Unlock()
+		go g.refreshModelCacheAsync()
+		return rename, redirect
+	}
+	g.modelMu.Unlock()
+
+	return g.refreshModelCacheSync(ctx)
+}
+
+func (g *gateway) refreshModelCacheAsync() {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	_, _ = g.refreshModelCacheSync(ctx)
+}
+
+func (g *gateway) refreshModelCacheSync(ctx context.Context) (map[string]string, map[string]string) {
+	rename, err := g.fetchModelMaps(ctx)
+	g.modelMu.Lock()
 	defer g.modelMu.Unlock()
 
-	if g.modelCache != nil && time.Since(g.modelCache.loadedAt) < modelCacheTTL {
-		return cloneStringMap(g.modelCache.rename), cloneStringMap(g.modelCache.redirect)
-	}
-
-	rename, err := g.fetchModelMaps(ctx)
 	if err != nil {
 		if g.modelCache != nil {
 			log.Printf("[模型] 刷新失败，使用缓存: %v", err)
@@ -38,8 +63,10 @@ func (g *gateway) modelMaps(ctx context.Context) (map[string]string, map[string]
 		}
 		log.Printf("[模型] 刷新失败且无缓存: %v", err)
 		rename = cloneStringMap(g.cfg.project.specialModels)
+		if rename == nil {
+			rename = make(map[string]string)
+		}
 		redirect := buildRedirect(rename)
-		// 短暂缓存失败结果，避免上游故障时并发请求在互斥锁后逐个等待 8 秒。
 		g.modelCache = &cachedModels{
 			rename:   cloneStringMap(rename),
 			redirect: cloneStringMap(redirect),
@@ -90,6 +117,9 @@ func (g *gateway) fetchModelMaps(parent context.Context) (map[string]string, err
 	}
 
 	rename := cloneStringMap(g.cfg.project.specialModels)
+	if rename == nil {
+		rename = make(map[string]string)
+	}
 	for _, id := range ids {
 		switch g.cfg.project.modelMode {
 		case modelKilo:
