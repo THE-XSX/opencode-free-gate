@@ -168,26 +168,33 @@ func (g *gateway) loadCandidates(parent context.Context) error {
 	if err := json.NewDecoder(io.LimitReader(res.Body, 4<<20)).Decode(&all); err != nil {
 		return err
 	}
-	sGrade := make([]proxyItem, 0, len(all))
-	aGrade := make([]proxyItem, 0, len(all))
+	var sGrade, aGrade, bGrade []proxyItem
 	for _, item := range all {
 		if item.Status != "active" {
 			continue
 		}
-		if item.QualityGrade == "S" {
+		switch strings.ToUpper(strings.TrimSpace(item.QualityGrade)) {
+		case "S":
 			sGrade = append(sGrade, item)
-		} else if item.QualityGrade == "A" || item.QualityGrade == "A+" {
+		case "A", "A+":
 			aGrade = append(aGrade, item)
+		case "B":
+			bGrade = append(bGrade, item)
 		}
 	}
 	sort.SliceStable(sGrade, func(i, j int) bool { return sGrade[i].Latency < sGrade[j].Latency })
 	sort.SliceStable(aGrade, func(i, j int) bool { return aGrade[i].Latency < aGrade[j].Latency })
+	sort.SliceStable(bGrade, func(i, j int) bool { return bGrade[i].Latency < bGrade[j].Latency })
+
 	filtered := append(sGrade, aGrade...)
+	if len(filtered) < g.cfg.slotCount {
+		filtered = append(filtered, bGrade...)
+	}
 
 	g.mu.Lock()
 	g.candidates = filtered
 	g.mu.Unlock()
-	log.Printf("[选] %d 可用代理候选 (%d S级, %d A级)", len(filtered), len(sGrade), len(aGrade))
+	log.Printf("[选] 从池获取到 %d 个原始代理 -> %d 个候选 (%d S级, %d A级, %d B级)", len(all), len(filtered), len(sGrade), len(aGrade), len(bGrade))
 	return nil
 }
 
