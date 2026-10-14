@@ -32,6 +32,7 @@ func main() {
 
 	rootContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	startUAFetcher(rootContext)
 	gw.start(rootContext)
 
 	server := &http.Server{
