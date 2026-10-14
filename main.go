@@ -314,6 +314,7 @@ func (a *app) handlePost(w http.ResponseWriter, r *http.Request, path string, de
 // applyRequestIDs 用网关派生的标识覆盖发往上游的 OpenCode 头。
 func applyRequestIDs(headers http.Header, ids requestIDs) {
 	headers.Set("X-Opencode-Session", ids.Session)
+	headers.Set("X-Opencode-Session-Id", ids.Session)
 	headers.Set("X-Opencode-Request", ids.Request)
 	headers.Set("X-Opencode-Project", ids.Project)
 	headers.Set("X-Session-Affinity", ids.Session)

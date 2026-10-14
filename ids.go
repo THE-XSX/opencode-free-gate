@@ -73,12 +73,22 @@ func conversationSeed(body map[string]any) string {
 
 func stableID(prefix, value string) string {
 	sum := sha256.Sum256([]byte(prefix + "\x00" + value))
+	if prefix == "ses" {
+		return prefix + "_" + hex.EncodeToString(sum[:])
+	}
 	return prefix + "_" + hex.EncodeToString(sum[:12])
 }
 
 func randomID(prefix string, size int) string {
+	if prefix == "ses" {
+		size = 32
+	}
 	buf := make([]byte, size)
 	if _, err := rand.Read(buf); err != nil {
+		if prefix == "ses" {
+			sum := sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+			return prefix + "_" + hex.EncodeToString(sum[:])
+		}
 		return prefix + "_" + fmt.Sprintf("%x", time.Now().UnixNano())
 	}
 	return prefix + "_" + hex.EncodeToString(buf)
