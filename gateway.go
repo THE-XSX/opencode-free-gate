@@ -100,6 +100,23 @@ func (g *gateway) start(ctx context.Context) {
 
 	if g.cfg.usesPublicPool() {
 		go func() {
+			// 启动时如果代理池为空，每 10 秒快速重试直到有可用代理
+			retryTicker := time.NewTicker(10 * time.Second)
+			defer retryTicker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-retryTicker.C:
+					if g.slotCount() == 0 {
+						_ = g.loadCandidates(ctx)
+						_ = g.fillSlots(ctx)
+					}
+				}
+			}
+		}()
+
+		go func() {
 			ticker := time.NewTicker(g.cfg.refreshInterval)
 			defer ticker.Stop()
 			for {
@@ -151,18 +168,26 @@ func (g *gateway) loadCandidates(parent context.Context) error {
 	if err := json.NewDecoder(io.LimitReader(res.Body, 4<<20)).Decode(&all); err != nil {
 		return err
 	}
-	filtered := make([]proxyItem, 0, len(all))
+	sGrade := make([]proxyItem, 0, len(all))
+	aGrade := make([]proxyItem, 0, len(all))
 	for _, item := range all {
-		if item.QualityGrade == "S" && item.Status == "active" {
-			filtered = append(filtered, item)
+		if item.Status != "active" {
+			continue
+		}
+		if item.QualityGrade == "S" {
+			sGrade = append(sGrade, item)
+		} else if item.QualityGrade == "A" || item.QualityGrade == "A+" {
+			aGrade = append(aGrade, item)
 		}
 	}
-	sort.SliceStable(filtered, func(i, j int) bool { return filtered[i].Latency < filtered[j].Latency })
+	sort.SliceStable(sGrade, func(i, j int) bool { return sGrade[i].Latency < sGrade[j].Latency })
+	sort.SliceStable(aGrade, func(i, j int) bool { return aGrade[i].Latency < aGrade[j].Latency })
+	filtered := append(sGrade, aGrade...)
 
 	g.mu.Lock()
 	g.candidates = filtered
 	g.mu.Unlock()
-	log.Printf("[选] %d S-grade candidates", len(filtered))
+	log.Printf("[选] %d 可用代理候选 (%d S级, %d A级)", len(filtered), len(sGrade), len(aGrade))
 	return nil
 }
 
@@ -341,10 +366,12 @@ func redactProxy(raw string) string {
 
 func (g *gateway) probe(ctx context.Context, candidate slot) bool {
 	deadline := time.Now().Add(g.cfg.probeTimeout)
+	headers := g.cfg.project.probeHeaders.Clone()
+	headers.Set("User-Agent", opencodeUserAgent())
 	request := upstreamRequest{
 		method:   http.MethodGet,
 		path:     g.cfg.project.probePath,
-		headers:  g.cfg.project.probeHeaders.Clone(),
+		headers:  headers,
 		deadline: deadline,
 	}
 	live, err := g.openUpstream(ctx, request, candidate.proxyURL, g.cfg.probeTimeout)
