@@ -34,6 +34,7 @@ type config struct {
 	nonStreamTimeout time.Duration
 	probeTimeout     time.Duration
 	refreshInterval  time.Duration
+	poolEmptyBackoff time.Duration
 	streamIdle       time.Duration
 }
 
@@ -71,6 +72,7 @@ func loadConfig(project projectSpec) config {
 		nonStreamTimeout: envMilliseconds("NON_STREAM_TIMEOUT", 300000),
 		probeTimeout:     envMilliseconds("PROXY_PROBE_TIMEOUT", 8000),
 		refreshInterval:  envMilliseconds("PROXY_REFRESH_MS", 300000),
+		poolEmptyBackoff: envMilliseconds("POOL_EMPTY_BACKOFF_MS", 20000),
 		streamIdle:       300 * time.Second,
 	}
 }

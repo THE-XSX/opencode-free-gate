@@ -427,3 +427,135 @@ func TestConcurrentPublicSlotSelectionRoundRobins(t *testing.T) {
 		}
 	}
 }
+
+// newPoolStubGateway 构造一个公共池固定返回 payload 的网关，用于空池相关的用例。
+func newPoolStubGateway(t *testing.T, payload string, configure func(*config)) (*gateway, *atomic.Int32) {
+	t.Helper()
+
+	var poolCalls atomic.Int32
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		poolCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(payload))
+	}))
+	t.Cleanup(pool.Close)
+
+	cfg := config{
+		project:          projectSpec{upstream: "https://upstream.invalid", directFallback: true},
+		proxyAPI:         pool.URL,
+		proxyMode:        "auto",
+		slotCount:        3,
+		slotRetries:      3,
+		firstByteTimeout: time.Second,
+		hardTimeout:      5 * time.Second,
+	}
+	if configure != nil {
+		configure(&cfg)
+	}
+	return newGateway(cfg), &poolCalls
+}
+
+func TestEmptyPoolBackoffSkipsRequestPathFetch(t *testing.T) {
+	var directCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		directCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	// 上游池处于 emergency 时对 /api/proxies 返回的就是 HTTP 200 + null。
+	gw, poolCalls := newPoolStubGateway(t, "null", func(cfg *config) {
+		cfg.project.upstream = upstream.URL
+		cfg.poolEmptyBackoff = time.Minute
+	})
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		response, err := gw.dispatch(context.Background(), upstreamRequest{
+			method:    http.MethodGet,
+			path:      "/v1/models",
+			headers:   http.Header{},
+			nonStream: true,
+			deadline:  time.Now().Add(gw.cfg.hardTimeout),
+		}, newRequestTrace())
+		if err != nil {
+			t.Fatalf("attempt %d: unexpected error: %v", attempt, err)
+		}
+		if response.status != http.StatusOK {
+			t.Fatalf("attempt %d: expected direct 200, got %d", attempt, response.status)
+		}
+	}
+
+	if got := poolCalls.Load(); got != 1 {
+		t.Fatalf("empty pool should be fetched once and then backed off, got %d fetches", got)
+	}
+	if got := directCalls.Load(); got != 3 {
+		t.Fatalf("expected 3 direct fallbacks, got %d", got)
+	}
+	if !gw.poolBackoffActive() {
+		t.Fatal("expected the empty pool to open the backoff window")
+	}
+}
+
+func TestPoolBackoffCoversFilteredOutGrades(t *testing.T) {
+	// 池里只有被过滤掉的 C 级代理时，候选依然是 0，同样应该进入退避。
+	gw, _ := newPoolStubGateway(t, `[{"address":"127.0.0.1:9","protocol":"http","latency":2200,"quality_grade":"C","status":"active"}]`, func(cfg *config) {
+		cfg.poolEmptyBackoff = time.Minute
+	})
+
+	if err := gw.loadCandidates(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(gw.candidates) != 0 {
+		t.Fatalf("expected 0 candidates, got %d", len(gw.candidates))
+	}
+	if !gw.poolBackoffActive() {
+		t.Fatal("expected a filtered-out pool to open the backoff window")
+	}
+}
+
+func TestPoolRecoveryClearsBackoffWindow(t *testing.T) {
+	var empty atomic.Bool
+	empty.Store(true)
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if empty.Load() {
+			_, _ = w.Write([]byte("null"))
+			return
+		}
+		_, _ = w.Write([]byte(`[{"address":"127.0.0.1:1","protocol":"http","latency":200,"quality_grade":"S","status":"active"}]`))
+	}))
+	defer pool.Close()
+
+	cfg := config{
+		project:          projectSpec{upstream: "https://upstream.invalid", directFallback: true},
+		proxyAPI:         pool.URL,
+		proxyMode:        "auto",
+		slotCount:        3,
+		slotRetries:      3,
+		poolEmptyBackoff: time.Minute,
+		firstByteTimeout: time.Second,
+		hardTimeout:      5 * time.Second,
+	}
+	gw := newGateway(cfg)
+
+	if err := gw.loadCandidates(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gw.poolBackoffActive() {
+		t.Fatal("expected the empty pool to open the backoff window")
+	}
+
+	// 后台刷新协程（启动期 10 秒重试 / PROXY_REFRESH_MS 周期）观察到池恢复后，
+	// 退避窗口必须立刻失效，让后续请求重新走公共代理层。
+	empty.Store(false)
+	if err := gw.loadCandidates(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gw.poolBackoffActive() {
+		t.Fatal("expected pool recovery to clear the backoff window")
+	}
+	if got := len(gw.candidates); got != 1 {
+		t.Fatalf("expected 1 candidate, got %d", got)
+	}
+}

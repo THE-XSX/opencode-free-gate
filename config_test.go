@@ -6,7 +6,7 @@ import (
 )
 
 func TestRetryDefaults(t *testing.T) {
-	for _, key := range []string{"SLOT_COUNT", "SLOT_RETRIES", "CUSTOM_RETRIES", "ZENPROXY_RETRIES", "NON_STREAM_TIMEOUT"} {
+	for _, key := range []string{"SLOT_COUNT", "SLOT_RETRIES", "CUSTOM_RETRIES", "ZENPROXY_RETRIES", "NON_STREAM_TIMEOUT", "POOL_EMPTY_BACKOFF_MS"} {
 		t.Setenv(key, "")
 	}
 	cfg := loadConfig(currentProject())
@@ -16,6 +16,9 @@ func TestRetryDefaults(t *testing.T) {
 	}
 	if cfg.nonStreamTimeout != 5*time.Minute {
 		t.Fatalf("expected 5 minute non-stream timeout, got %s", cfg.nonStreamTimeout)
+	}
+	if cfg.poolEmptyBackoff != 20*time.Second {
+		t.Fatalf("expected 20 second empty-pool backoff, got %s", cfg.poolEmptyBackoff)
 	}
 }
 

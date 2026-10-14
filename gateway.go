@@ -75,6 +75,12 @@ type gateway struct {
 	modelMu         sync.Mutex
 	modelCache      *cachedModels
 	responsesModels sync.Map
+
+	// 公共池为空的状态。上游池进入 emergency 后会持续返回空列表，
+	// 记录状态是为了让请求路径在短时间内不再重复拉取。
+	poolMu      sync.Mutex
+	poolEmpty   bool
+	poolEmptyAt time.Time
 }
 
 func newGateway(cfg config) *gateway {
@@ -195,7 +201,41 @@ func (g *gateway) loadCandidates(parent context.Context) error {
 	g.candidates = filtered
 	g.mu.Unlock()
 	log.Printf("[选] 从池获取到 %d 个原始代理 -> %d 个候选 (%d S级, %d A级, %d B级)", len(all), len(filtered), len(sGrade), len(aGrade), len(bGrade))
+	g.notePoolResult(len(all), len(filtered))
 	return nil
+}
+
+// poolBackoffActive 报告公共池是否处于"空池退避"窗口内。上游池处于 emergency
+// 时对 /api/proxies 返回的是 HTTP 200 + null（不是错误），窗口内再密集重试也只会
+// 让每个请求都白白消耗自己的一部分超时预算去换一个空列表，因此只在窗口外拉取。
+func (g *gateway) poolBackoffActive() bool {
+	if g.cfg.poolEmptyBackoff <= 0 {
+		return false
+	}
+	g.poolMu.Lock()
+	defer g.poolMu.Unlock()
+	return g.poolEmpty && time.Since(g.poolEmptyAt) < g.cfg.poolEmptyBackoff
+}
+
+// notePoolResult 记录一次候选拉取的结果。候选为空（原始列表为空，或全部被等级
+// 过滤掉）时进入退避窗口，并且只在状态翻转时打日志，避免空池期间每轮刷新刷屏。
+func (g *gateway) notePoolResult(raw, candidates int) {
+	empty := candidates == 0
+	g.poolMu.Lock()
+	wasEmpty := g.poolEmpty
+	g.poolEmpty = empty
+	if empty {
+		g.poolEmptyAt = time.Now()
+	}
+	g.poolMu.Unlock()
+
+	switch {
+	case empty && !wasEmpty:
+		log.Printf("[选] 池为空: 原始代理 %d 个 -> 候选 0 个, 进入 %s 退避窗口 (窗口内不再随请求同步拉取; 未配置 ZENPROXY_KEY/CUSTOM_PROXIES 时流量将退化为直连)",
+			raw, g.cfg.poolEmptyBackoff)
+	case !empty && wasEmpty:
+		log.Printf("[选] 池已恢复: 原始代理 %d 个 -> 候选 %d 个, 退出退避窗口", raw, candidates)
+	}
 }
 
 func controlTransport(timeout time.Duration) *http.Transport {
@@ -788,7 +828,10 @@ func (g *gateway) dispatch(ctx context.Context, request upstreamRequest, trace *
 }
 
 func (g *gateway) dispatchPublicLayer(ctx context.Context, request upstreamRequest, trace *requestTrace) (*gatewayResponse, error) {
-	if g.slotCount() == 0 {
+	// 槽位为空时补池。空池退避窗口内跳过这次同步拉取：候选列表注定为空，
+	// 却要让当前请求在自己的超时预算里等一次完整的 HTTPS 往返，
+	// 补池交给后台的 PROXY_REFRESH_MS 刷新与启动期重试协程即可。
+	if g.slotCount() == 0 && !g.poolBackoffActive() {
 		fillContext, cancel := context.WithDeadline(ctx, request.deadline)
 		_ = g.fillSlots(fillContext)
 		cancel()
