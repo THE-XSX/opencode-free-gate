@@ -8,3 +8,6 @@ gate
 *.test
 .vscode
 .idea
+dist
+*.exe
+*.exe~
