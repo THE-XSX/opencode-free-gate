@@ -48,6 +48,9 @@ type requestTrace struct {
 	proxies     map[string]struct{}
 	finalProxy  string
 	finalStatus int
+	// sentBytes 与 streamNote 在转发真正结束后回填，供完成日志使用。
+	sentBytes  int64
+	streamNote string
 }
 
 func newRequestTrace() *requestTrace {
@@ -62,10 +65,22 @@ func (t *requestTrace) addAttempt(proxyName string) {
 type gateway struct {
 	cfg config
 
-	mu         sync.RWMutex
-	candidates []proxyItem
-	slots      []slot
-	custom     []slot
+	// direct 是直连层（以及 ZenProxy relay）专用的长生命周期连接池。
+	// 上游是固定域名，复用连接（HTTP/2 优先）能省掉每次直连请求 1s 量级的 TLS 握手；
+	// 代理层仍然每次尝试新建独立连接，避免故障代理污染连接池。
+	direct *http.Transport
+
+	mu                 sync.RWMutex
+	candidates         []proxyItem
+	candidatesLoadedAt time.Time // 最近一次完成的拉取（包括失败），用于短时去重。
+	candidatesLoading  chan struct{}
+	candidatesLoadErr  error
+	slots              []slot
+	custom             []slot
+	// slotsChanged 在槽位集合变化时关闭并立即替换，让等槽的请求不必轮询；
+	// fillInFlight 指向正在进行的异步补池，补池结束时关闭。
+	slotsChanged chan struct{}
+	fillInFlight chan struct{}
 
 	fillMu          sync.Mutex
 	refreshMu       sync.Mutex
@@ -74,6 +89,7 @@ type gateway struct {
 	rootContext     context.Context
 	modelMu         sync.Mutex
 	modelCache      *cachedModels
+	modelRefresh    chan struct{}
 	responsesModels sync.Map
 
 	// 公共池为空的状态。上游池进入 emergency 后会持续返回空列表，
@@ -84,24 +100,42 @@ type gateway struct {
 }
 
 func newGateway(cfg config) *gateway {
-	return &gateway{cfg: cfg}
+	return &gateway{cfg: cfg, direct: directTransport(cfg), slotsChanged: make(chan struct{})}
 }
 
 func (g *gateway) start(ctx context.Context) {
 	g.rootContext = ctx
+
+	// 启动时异步预热模型映射；冷缓存请求立即使用内置映射，不等待网络。
+	if g.cfg.project.modelMode != modelPassthrough {
+		g.startModelRefresh()
+	}
+
+	// 公共池与自定义代理没有依赖关系，并行预热：配置成自定义层优先时，
+	// 不该因为公共池响应慢而推迟自定义槽位的探活。
 	go func() {
+		var warmup sync.WaitGroup
 		if g.cfg.usesPublicPool() {
-			if err := g.loadCandidates(ctx); err != nil {
-				log.Printf("[选] load failed: %v", err)
-			}
-			if err := g.fillSlots(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("[槽] initial fill failed: %v", err)
-			}
+			warmup.Add(1)
+			go func() {
+				defer warmup.Done()
+				if err := g.loadCandidates(ctx); err != nil {
+					log.Printf("[选] load failed: %v", err)
+				}
+				if err := g.fillSlots(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("[槽] initial fill failed: %v", err)
+				}
+			}()
 		}
-		if err := g.initCustomSlots(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("[兜底] initial fill failed: %v", err)
-		}
-		log.Printf("[门] 预热完成")
+		warmup.Add(1)
+		go func() {
+			defer warmup.Done()
+			if err := g.initCustomSlots(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("[兜底] initial fill failed: %v", err)
+			}
+		}()
+		warmup.Wait()
+		log.Printf("[门] 预热完成 (公共槽 %d/%d, 自定义槽 %d)", g.slotCount(), g.cfg.slotCount, g.customCount())
 	}()
 
 	if g.cfg.usesPublicPool() {
@@ -149,7 +183,44 @@ func (g *gateway) refresh(ctx context.Context) {
 	}
 }
 
-func (g *gateway) loadCandidates(parent context.Context) error {
+func (g *gateway) loadCandidates(parent context.Context) (resultErr error) {
+	// 启动、定时刷新和请求补槽共用同一个拉取入口。正在拉取时等待同一份
+	// 结果（仍尊重调用方取消），完成后 2 秒内复用结果，包括空池和 API 错误。
+	for {
+		if err := parent.Err(); err != nil {
+			return err
+		}
+		g.mu.Lock()
+		if done := g.candidatesLoading; done != nil {
+			g.mu.Unlock()
+			select {
+			case <-parent.Done():
+				return parent.Err()
+			case <-done:
+				continue
+			}
+		}
+		if !g.candidatesLoadedAt.IsZero() && time.Since(g.candidatesLoadedAt) < candidateReloadDebounce {
+			err := g.candidatesLoadErr
+			g.mu.Unlock()
+			return err
+		}
+		g.candidatesLoading = make(chan struct{})
+		g.mu.Unlock()
+		break
+	}
+	defer func() {
+		g.mu.Lock()
+		// 不缓存调用方取消，避免一个请求断开后阻止后台重新拉取。
+		if parent.Err() == nil {
+			g.candidatesLoadedAt = time.Now()
+			g.candidatesLoadErr = resultErr
+		}
+		close(g.candidatesLoading)
+		g.candidatesLoading = nil
+		g.mu.Unlock()
+	}()
+
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 
@@ -250,6 +321,46 @@ func controlTransport(timeout time.Duration) *http.Transport {
 	}
 }
 
+// candidateReloadDebounce 限制所有补池入口对同一候选 API 的重复拉取。
+const candidateReloadDebounce = 2 * time.Second
+
+// poolFillWait 是公共槽为空时，请求路径愿意等待补槽的上限。补池在后台继续跑，
+// 这里只是给一次正在进行的探活留出落地时间；超时就用后续层级接住请求，
+// 避免一个全是死代理的候选批次吃掉整个请求预算。声明为变量便于测试缩短等待。
+var poolFillWait = 1500 * time.Millisecond
+
+// waitForSlot 等待正在进行的补池落地：出现槽位、补池结束、超出 poolFillWait
+// 或请求预算耗尽时返回。没有补池在跑时立即返回——等不到结果的等待只会白白消耗预算。
+func (g *gateway) waitForSlot(ctx context.Context, deadline time.Time) {
+	if g.rootContext == nil {
+		return
+	}
+	wait := boundedWait(deadline, poolFillWait)
+	if wait <= 0 {
+		return
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for {
+		g.mu.RLock()
+		ready := len(g.slots) > 0 || len(g.custom) > 0
+		changed := g.slotsChanged
+		inFlight := g.fillInFlight
+		g.mu.RUnlock()
+		if ready || inFlight == nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			return
+		case <-changed:
+		case <-inFlight:
+		}
+	}
+}
+
 func (g *gateway) fillSlots(ctx context.Context) error {
 	if !g.fillMu.TryLock() {
 		return nil
@@ -277,6 +388,11 @@ func (g *gateway) fillSlots(ctx context.Context) error {
 		latency time.Duration
 		ok      bool
 	}
+	// 探活并发进行，成功一个就立即入槽；槽位补满后放弃剩余探活，
+	// 否则一个不响应的代理就能把整次补池（以及正在等槽的请求）拖到探活超时。
+	probeContext, cancelProbes := context.WithCancel(ctx)
+	defer cancelProbes()
+
 	results := make(chan probeResult, len(batch))
 	var wg sync.WaitGroup
 	for _, item := range batch {
@@ -290,7 +406,7 @@ func (g *gateway) fillSlots(ctx context.Context) error {
 				return
 			}
 			started := time.Now()
-			ok := g.probe(ctx, s)
+			ok := g.probe(probeContext, s)
 			results <- probeResult{slot: s, latency: time.Since(started), ok: ok}
 		}()
 	}
@@ -301,12 +417,20 @@ func (g *gateway) fillSlots(ctx context.Context) error {
 
 	added := 0
 	for result := range results {
-		if !result.ok || g.slotCount() >= g.cfg.slotCount {
+		if !result.ok {
 			continue
+		}
+		if g.slotCount() >= g.cfg.slotCount {
+			break
 		}
 		if g.addSlot(result.slot, false) {
 			added++
 			log.Printf("[探+] %s (%dms)", result.slot.addr, result.latency.Milliseconds())
+		}
+		// 槽位已满就地退出：否则还要等下一个探活结果才能重新判断，
+		// 一个不响应的代理就能把这次补池拖到探活超时。
+		if g.slotCount() >= g.cfg.slotCount {
+			break
 		}
 	}
 	log.Printf("[槽] %d/%d ready (added %d)", g.slotCount(), g.cfg.slotCount, added)
@@ -464,7 +588,14 @@ func (g *gateway) addSlot(candidate slot, custom bool) bool {
 		}
 	}
 	*target = append(*target, candidate)
+	g.notifySlotsChangedLocked()
 	return true
+}
+
+// notifySlotsChangedLocked 关闭并替换广播通道，唤醒正在等槽的请求。调用方必须持有 g.mu。
+func (g *gateway) notifySlotsChangedLocked() {
+	close(g.slotsChanged)
+	g.slotsChanged = make(chan struct{})
 }
 
 func (g *gateway) slotCount() int {
@@ -546,6 +677,9 @@ func (g *gateway) dropSlot(address string) {
 		}
 	}
 	remaining := len(g.slots)
+	if removed {
+		g.notifySlotsChangedLocked()
+	}
 	g.mu.Unlock()
 	if !removed {
 		return
@@ -558,8 +692,19 @@ func (g *gateway) scheduleFill() {
 	if g.rootContext == nil || !g.refillRunning.CompareAndSwap(false, true) {
 		return
 	}
+	// 在启动补池前登记完成信号，等槽的请求才能看到这次补池。
+	done := make(chan struct{})
+	g.mu.Lock()
+	g.fillInFlight = done
+	g.mu.Unlock()
 	go func() {
-		defer g.refillRunning.Store(false)
+		defer func() {
+			g.mu.Lock()
+			g.fillInFlight = nil
+			g.mu.Unlock()
+			close(done)
+			g.refillRunning.Store(false)
+		}()
 		ctx, cancel := context.WithTimeout(g.rootContext, g.cfg.probeTimeout+5*time.Second)
 		defer cancel()
 		if err := g.fillSlots(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -589,10 +734,12 @@ type gatewayResponse struct {
 }
 
 type liveResponse struct {
-	response  *http.Response
-	cancel    context.CancelFunc
-	transport *http.Transport
-	once      sync.Once
+	response *http.Response
+	cancel   context.CancelFunc
+	// teardown 释放本次尝试独占的资源：一次性 Transport 会关掉自己的空闲连接，
+	// 复用直连连接池时是空操作（否则每个请求都会把连接池清空）。
+	teardown func()
+	once     sync.Once
 }
 
 func (r *liveResponse) Close() {
@@ -604,7 +751,7 @@ func (r *liveResponse) Close() {
 			_ = r.response.Body.Close()
 		}
 		r.cancel()
-		r.transport.CloseIdleConnections()
+		r.teardown()
 	})
 }
 
@@ -638,7 +785,11 @@ func (r *liveResponse) readAll(deadline time.Time) ([]byte, error) {
 func (g *gateway) openUpstream(ctx context.Context, request upstreamRequest, proxyURL *url.URL, maxWait time.Duration) (*liveResponse, error) {
 	target := strings.TrimRight(g.cfg.project.upstream, "/") + request.path
 	wait, connectTimeout, responseHeaderTimeout := g.openTimeouts(request.deadline, maxWait)
-	return openHTTP(ctx, request.method, target, request.headers, request.body, proxyURL, wait, connectTimeout, responseHeaderTimeout)
+	plan := dialPlan{shared: g.direct}
+	if proxyURL != nil {
+		plan = dialPlan{proxy: proxyURL}
+	}
+	return openHTTP(ctx, request.method, target, request.headers, request.body, plan, wait, connectTimeout, responseHeaderTimeout)
 }
 
 func (g *gateway) openTimeouts(deadline time.Time, firstByteLimit time.Duration) (time.Duration, time.Duration, time.Duration) {
@@ -651,7 +802,14 @@ func (g *gateway) openTimeouts(deadline time.Time, firstByteLimit time.Duration)
 	return wait, connectTimeout, 0
 }
 
-func openHTTP(ctx context.Context, method, target string, headers http.Header, body []byte, proxyURL *url.URL, wait, connectTimeout, responseHeaderTimeout time.Duration) (*liveResponse, error) {
+// dialPlan 决定一次尝试怎么建立连接：shared 复用长连接池（直连层），proxy 每次新建独立连接
+// （代理层，故障代理的连接不应被后续请求复用）。
+type dialPlan struct {
+	shared *http.Transport
+	proxy  *url.URL
+}
+
+func openHTTP(ctx context.Context, method, target string, headers http.Header, body []byte, plan dialPlan, wait, connectTimeout, responseHeaderTimeout time.Duration) (*liveResponse, error) {
 	if wait <= 0 {
 		return nil, errRequestTimeout
 	}
@@ -672,7 +830,14 @@ func openHTTP(ctx context.Context, method, target string, headers http.Header, b
 		cancel()
 	})
 
-	transport := requestTransport(proxyURL, connectTimeout, responseHeaderTimeout)
+	// 复用长连接的 Transport 不能按请求回收，否则连接池形同虚设；一次性 Transport 则要在
+	// 每次尝试结束时立即释放，避免故障代理留下的连接被后续请求复用。
+	transport := plan.shared
+	teardown := func() {}
+	if transport == nil {
+		transport = requestTransport(plan.proxy, connectTimeout, responseHeaderTimeout)
+		teardown = transport.CloseIdleConnections
+	}
 	client := &http.Client{
 		Transport: transport,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -684,7 +849,7 @@ func openHTTP(ctx context.Context, method, target string, headers http.Header, b
 	if err != nil {
 		timer.Stop()
 		cancel()
-		transport.CloseIdleConnections()
+		teardown()
 		return nil, err
 	}
 	req.Header = headers.Clone()
@@ -695,7 +860,7 @@ func openHTTP(ctx context.Context, method, target string, headers http.Header, b
 	stopped := timer.Stop()
 	if err != nil {
 		cancel()
-		transport.CloseIdleConnections()
+		teardown()
 		select {
 		case <-timedOut:
 			return nil, errAttemptTimeout
@@ -710,10 +875,10 @@ func openHTTP(ctx context.Context, method, target string, headers http.Header, b
 		<-timedOut
 		_ = res.Body.Close()
 		cancel()
-		transport.CloseIdleConnections()
+		teardown()
 		return nil, errAttemptTimeout
 	}
-	return &liveResponse{response: res, cancel: cancel, transport: transport}, nil
+	return &liveResponse{response: res, cancel: cancel, teardown: teardown}, nil
 }
 
 func requestTransport(proxyURL *url.URL, connectTimeout, responseHeaderTimeout time.Duration) *http.Transport {
@@ -738,6 +903,35 @@ func requestTransport(proxyURL *url.URL, connectTimeout, responseHeaderTimeout t
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
 	return transport
+}
+
+// directTransport 构造直连层专用的长生命周期 Transport。全新建连一次到上游要 1s 量级
+// （实测 TLS 握手 1.18-1.29s，复用后首字节 0.47-0.54s），直连层又访问固定域名，因此这里
+// 开连接复用与 HTTP/2；代理层不走这里，保持"每次尝试独立连接"的故障隔离。
+// ResponseHeaderTimeout 交给 openHTTP 的每次尝试预算控制，不在 Transport 上设固定值。
+func directTransport(cfg config) *http.Transport {
+	connectTimeout := cfg.firstByteTimeout
+	if connectTimeout <= 0 {
+		connectTimeout = 3 * time.Second
+	}
+	return &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   connectTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:      true,
+		MaxIdleConns:           32,
+		MaxIdleConnsPerHost:    8,
+		IdleConnTimeout:        90 * time.Second,
+		TLSHandshakeTimeout:    connectTimeout,
+		ExpectContinueTimeout:  time.Second,
+		MaxResponseHeaderBytes: 1 << 20,
+		DisableCompression:     true,
+		TLSClientConfig: &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: true, // 保持旧网关行为；上游与代理链可能使用非标准证书。
+		},
+	}
 }
 
 func boundedWait(deadline time.Time, maximum time.Duration) time.Duration {
@@ -783,13 +977,14 @@ func (g *gateway) dispatch(ctx context.Context, request upstreamRequest, trace *
 		return g.dispatchZen(ctx, request, trace)
 	}
 
+	layers := g.cfg.orderedLayers()
 	var last *gatewayResponse
-	for _, layer := range g.cfg.orderedLayers() {
+	for index, layer := range layers {
 		var response *gatewayResponse
 		var err error
 		switch layer {
 		case layerPublic:
-			response, err = g.dispatchPublicLayer(ctx, request, trace)
+			response, err = g.dispatchPublicLayer(ctx, request, trace, g.laterLayersServeRequest(layers[index+1:]))
 		case layerZen:
 			if g.cfg.zenKey == "" {
 				continue
@@ -827,14 +1022,41 @@ func (g *gateway) dispatch(ctx context.Context, request upstreamRequest, trace *
 	return nil, errNoProxy
 }
 
-func (g *gateway) dispatchPublicLayer(ctx context.Context, request upstreamRequest, trace *requestTrace) (*gatewayResponse, error) {
-	// 槽位为空时补池。空池退避窗口内跳过这次同步拉取：候选列表注定为空，
-	// 却要让当前请求在自己的超时预算里等一次完整的 HTTPS 往返，
-	// 补池交给后台的 PROXY_REFRESH_MS 刷新与启动期重试协程即可。
+// laterLayersServeRequest 报告公共层之后是否还有层能接住一次请求。
+// 直连兜底打开时永远为真；自定义层与 ZenProxy 只有真正可用（有槽位 / 有 key）时才算。
+func (g *gateway) laterLayersServeRequest(layers []string) bool {
+	if g.cfg.project.directFallback {
+		return true
+	}
+	for _, layer := range layers {
+		switch layer {
+		case layerZen:
+			if g.cfg.zenKey != "" {
+				return true
+			}
+		case layerCustom:
+			if g.customCount() > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (g *gateway) dispatchPublicLayer(ctx context.Context, request upstreamRequest, trace *requestTrace, canFallThrough bool) (*gatewayResponse, error) {
+	// 槽位为空时补池，但补池（拉列表 + 探活）不再占用请求预算：
+	// 有后备层时补池交给后台，最多等 poolFillWait 让正在进行的探活落地；
+	// 只有在公共池是这次请求唯一去处时，才按请求预算同步补池。
+	// 空池退避窗口内一律跳过：候选列表注定为空，等也只会白等。
 	if g.slotCount() == 0 && !g.poolBackoffActive() {
-		fillContext, cancel := context.WithDeadline(ctx, request.deadline)
-		_ = g.fillSlots(fillContext)
-		cancel()
+		if canFallThrough {
+			g.scheduleFill()
+			g.waitForSlot(ctx, request.deadline)
+		} else {
+			fillContext, cancel := context.WithDeadline(ctx, request.deadline)
+			_ = g.fillSlots(fillContext)
+			cancel()
+		}
 	}
 
 	var last *gatewayResponse
@@ -973,7 +1195,7 @@ func (g *gateway) performRelay(ctx context.Context, request upstreamRequest) (*g
 		firstByteLimit = 0
 	}
 	wait, connectTimeout, responseHeaderTimeout := g.openTimeouts(request.deadline, firstByteLimit)
-	live, err := openHTTP(ctx, http.MethodPost, relay.String(), headers, request.body, nil, wait, connectTimeout, responseHeaderTimeout)
+	live, err := openHTTP(ctx, http.MethodPost, relay.String(), headers, request.body, dialPlan{shared: g.direct}, wait, connectTimeout, responseHeaderTimeout)
 	if err != nil {
 		if errors.Is(err, errAttemptTimeout) && time.Until(request.deadline) <= 0 {
 			return nil, errRequestTimeout

@@ -15,37 +15,99 @@ import (
 
 const modelCacheTTL = 60 * time.Second
 
+// modelWarmWait 是冷启动时改写请求体愿意等待首次模型刷新的上限。模型列表本身
+// （wait=0）可以立即用内置兜底返回，但改写请求体必须先有映射，否则会把展示名
+// 当成上游模型名发出去；这里给正在进行的刷新一个有界窗口，超时仍用兜底映射。
+const modelWarmWait = 800 * time.Millisecond
+
 type cachedModels struct {
 	rename   map[string]string
 	redirect map[string]string
 	loadedAt time.Time
 }
 
-func (g *gateway) modelMaps(ctx context.Context) (map[string]string, map[string]string) {
+// modelMaps 返回模型映射。wait 是冷启动时等待首次刷新落地的时间上限：
+// 列模型（wait=0）拿到兜底结果就能用，改写请求体则需要真实映射才不会发错模型名。
+func (g *gateway) modelMaps(ctx context.Context, wait time.Duration) (map[string]string, map[string]string) {
 	g.modelMu.Lock()
 	cached := g.modelCache
-	if cached != nil && time.Since(cached.loadedAt) < modelCacheTTL {
-		rename := cloneStringMap(cached.rename)
-		redirect := cloneStringMap(cached.redirect)
-		g.modelMu.Unlock()
-		return rename, redirect
-	}
-	// 已有缓存过期时先返回旧缓存并在后台异步刷新，避免并发请求在互斥锁处排队等待 8 秒
 	if cached != nil {
-		cached.loadedAt = time.Now().Add(-(modelCacheTTL - 10*time.Second))
+		fresh := time.Since(cached.loadedAt) < modelCacheTTL
 		rename := cloneStringMap(cached.rename)
 		redirect := cloneStringMap(cached.redirect)
 		g.modelMu.Unlock()
-		go g.refreshModelCacheAsync()
+		if fresh {
+			return rename, redirect
+		}
+		// 缓存过期：先返回旧值，同时单飞发起后台刷新，避免并发请求在锁上排队等 8 秒。
+		g.startModelRefresh()
 		return rename, redirect
 	}
 	g.modelMu.Unlock()
 
-	return g.refreshModelCacheSync(ctx)
+	// 冷缓存：刷新交给后台，任何时候都不占用整段请求预算。
+	done := g.startModelRefresh()
+	if wait > 0 {
+		if deadline, ok := ctx.Deadline(); ok {
+			if remaining := time.Until(deadline); remaining < wait {
+				wait = remaining
+			}
+		}
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-done:
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+			timer.Stop()
+		}
+	}
+
+	g.modelMu.Lock()
+	defer g.modelMu.Unlock()
+	if g.modelCache != nil {
+		return cloneStringMap(g.modelCache.rename), cloneStringMap(g.modelCache.redirect)
+	}
+	return fallbackModelMaps(g.cfg)
+}
+
+// startModelRefresh 保证同一时刻只有一个模型表刷新在跑，返回该次刷新的完成信号。
+func (g *gateway) startModelRefresh() <-chan struct{} {
+	g.modelMu.Lock()
+	defer g.modelMu.Unlock()
+	if g.modelRefresh != nil {
+		return g.modelRefresh
+	}
+	done := make(chan struct{})
+	// 另一个请求可能已在读取缓存与进入此函数之间完成刷新。
+	if g.modelCache != nil && time.Since(g.modelCache.loadedAt) < modelCacheTTL {
+		close(done)
+		return done
+	}
+	g.modelRefresh = done
+	go func() {
+		g.refreshModelCacheAsync()
+		g.modelMu.Lock()
+		g.modelRefresh = nil
+		close(done)
+		g.modelMu.Unlock()
+	}()
+	return done
+}
+
+// fallbackModelMaps 是模型表还没拿到时的最小可用映射：只有内置的模型别名。
+func fallbackModelMaps(cfg config) (map[string]string, map[string]string) {
+	rename := cloneStringMap(cfg.project.specialModels)
+	return rename, buildRedirect(rename)
 }
 
 func (g *gateway) refreshModelCacheAsync() {
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	parent := g.rootContext
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
 	defer cancel()
 	_, _ = g.refreshModelCacheSync(ctx)
 }
@@ -62,11 +124,7 @@ func (g *gateway) refreshModelCacheSync(ctx context.Context) (map[string]string,
 			return cloneStringMap(g.modelCache.rename), cloneStringMap(g.modelCache.redirect)
 		}
 		log.Printf("[模型] 刷新失败且无缓存: %v", err)
-		rename = cloneStringMap(g.cfg.project.specialModels)
-		if rename == nil {
-			rename = make(map[string]string)
-		}
-		redirect := buildRedirect(rename)
+		rename, redirect := fallbackModelMaps(g.cfg)
 		g.modelCache = &cachedModels{
 			rename:   cloneStringMap(rename),
 			redirect: cloneStringMap(redirect),
@@ -167,7 +225,8 @@ func extractModelIDs(body []byte) ([]string, error) {
 }
 
 func (g *gateway) modelsResponse(ctx context.Context) *gatewayResponse {
-	rename, _ := g.modelMaps(ctx)
+	// 列模型不需要真实映射：兜底列表里的展示名本身可用。
+	rename, _ := g.modelMaps(ctx, 0)
 	unique := make(map[string]struct{}, len(rename)+len(g.cfg.project.extraModels))
 	for _, display := range rename {
 		unique[display] = struct{}{}
@@ -200,7 +259,7 @@ func (g *gateway) modelsResponse(ctx context.Context) *gatewayResponse {
 }
 
 func (g *gateway) rewriteModel(ctx context.Context, body []byte) []byte {
-	_, redirect := g.modelMaps(ctx)
+	_, redirect := g.modelMaps(ctx, modelWarmWait)
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body

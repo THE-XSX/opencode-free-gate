@@ -28,6 +28,7 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	cfg := loadConfig(currentProject())
 	gw := newGateway(cfg)
+	defer gw.direct.CloseIdleConnections()
 	handler := &app{gateway: gw}
 
 	rootContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -410,8 +411,12 @@ func (a *app) finish(w http.ResponseWriter, r *http.Request, trace *requestTrace
 	if trace.finalProxy == "" && trace.attempts == 0 {
 		trace.finalProxy = "local"
 	}
+	// 完成日志放在转发真正结束之后：流式请求要等上游与客户端都结束，
+	// 耗时和结束原因才是这一次请求的真实结果。
+	outcome := writeGatewayResponse(w, r, response, a.gateway.cfg.streamIdle)
+	trace.sentBytes = outcome.bytes
+	trace.streamNote = outcome.note
 	a.logCompletion(r, trace)
-	writeGatewayResponse(w, r, response, a.gateway.cfg.streamIdle)
 }
 
 func (a *app) logCompletion(r *http.Request, trace *requestTrace) {
@@ -428,11 +433,40 @@ func (a *app) logCompletion(r *http.Request, trace *requestTrace) {
 	if proxy == "" {
 		proxy = "unknown"
 	}
-	log.Printf("[%s] %s %s | 状态:%d | 重试:%d | 代理IP:%d | 耗时:%dms | 代理:%s",
-		result, r.Method, r.URL.Path, status, retries, len(trace.proxies), time.Since(trace.start).Milliseconds(), proxy)
+	line := fmt.Sprintf("[%s] %s %s | 状态:%d | 重试:%d | 代理IP:%d | 耗时:%dms | 代理:%s | 发送:%dB",
+		result, r.Method, r.URL.Path, status, retries, len(trace.proxies), time.Since(trace.start).Milliseconds(), proxy, trace.sentBytes)
+	if trace.streamNote != "" {
+		line += " | 流:" + trace.streamNote
+	}
+	log.Print(line)
 }
 
-func writeGatewayResponse(w http.ResponseWriter, r *http.Request, response *gatewayResponse, streamIdle time.Duration) {
+// streamOutcome 记录一次转发的实际结果：写出字节数与异常结束原因。
+type streamOutcome struct {
+	bytes int64
+	note  string
+}
+
+// deadlineWriter 在每次写入前刷新下游写截止时间。客户端停止读取时 Write/Flush 会一直阻塞，
+// 既占住客户端连接也占住上游连接；服务端固定的 WriteTimeout 会把长流整体掐断，
+// 因此这里按每次写入刷新，语义与上游读取的 idle 上限一致。
+type deadlineWriter struct {
+	w          io.Writer
+	controller *http.ResponseController
+	timeout    time.Duration
+	written    int64
+}
+
+func (d *deadlineWriter) Write(p []byte) (int, error) {
+	if d.timeout > 0 {
+		_ = d.controller.SetWriteDeadline(time.Now().Add(d.timeout))
+	}
+	n, err := d.w.Write(p)
+	d.written += int64(n)
+	return n, err
+}
+
+func writeGatewayResponse(w http.ResponseWriter, r *http.Request, response *gatewayResponse, streamIdle time.Duration) streamOutcome {
 	for key, values := range response.header {
 		for _, value := range values {
 			w.Header().Add(key, value)
@@ -452,19 +486,22 @@ func writeGatewayResponse(w http.ResponseWriter, r *http.Request, response *gate
 	}
 	w.WriteHeader(response.status)
 	if response.live == nil {
-		_, _ = w.Write(response.body)
-		return
+		// 非流式响应体同样给下游写入一个空闲上限：客户端停止读取时，
+		// 一次 Write 也可能一直阻塞并长期占住连接。
+		body := &deadlineWriter{w: w, controller: http.NewResponseController(w), timeout: streamIdle}
+		written, _ := body.Write(response.body)
+		return streamOutcome{bytes: int64(written)}
 	}
 	if response.responsesBridge {
-		streamResponsesToChat(w, r.Context(), response.live, streamIdle, response.bridgeModel)
-		return
+		return streamResponsesToChat(w, r.Context(), response.live, streamIdle, response.bridgeModel)
 	}
-	streamResponse(w, r.Context(), response.live, streamIdle)
+	return streamResponse(w, r.Context(), response.live, streamIdle)
 }
 
-func streamResponse(w http.ResponseWriter, ctx context.Context, live *liveResponse, idle time.Duration) {
+func streamResponse(w http.ResponseWriter, ctx context.Context, live *liveResponse, idle time.Duration) streamOutcome {
 	defer live.Close()
 	flusher, _ := w.(http.Flusher)
+	downstream := &deadlineWriter{w: w, controller: http.NewResponseController(w), timeout: idle}
 	if flusher != nil {
 		flusher.Flush()
 	}
@@ -478,8 +515,8 @@ func streamResponse(w http.ResponseWriter, ctx context.Context, live *liveRespon
 		n, err := live.response.Body.Read(buffer)
 		stopped := timer.Stop()
 		if n > 0 {
-			if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
-				return
+			if _, writeErr := downstream.Write(buffer[:n]); writeErr != nil {
+				return streamOutcome{bytes: downstream.written, note: "客户端写入超时或断开"}
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -488,13 +525,18 @@ func streamResponse(w http.ResponseWriter, ctx context.Context, live *liveRespon
 		if !stopped {
 			<-idleElapsed
 			log.Printf("[流] %s 内无数据，已关闭连接", idle)
-			return
+			return streamOutcome{bytes: downstream.written, note: fmt.Sprintf("上游 %s 无数据", idle)}
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) && ctx.Err() == nil {
+			switch {
+			case errors.Is(err, io.EOF):
+				return streamOutcome{bytes: downstream.written}
+			case ctx.Err() != nil:
+				return streamOutcome{bytes: downstream.written, note: "客户端断开"}
+			default:
 				log.Printf("[流] upstream stream ended: %v", err)
+				return streamOutcome{bytes: downstream.written, note: "上游中断"}
 			}
-			return
 		}
 	}
 }
@@ -731,12 +773,14 @@ func convertUserContentParts(content any) []map[string]any {
 	}
 }
 
-func streamResponsesToChat(w http.ResponseWriter, ctx context.Context, live *liveResponse, idle time.Duration, model string) {
+func streamResponsesToChat(w http.ResponseWriter, ctx context.Context, live *liveResponse, idle time.Duration, model string) streamOutcome {
 	defer live.Close()
 	flusher, _ := w.(http.Flusher)
+	downstream := &deadlineWriter{w: w, controller: http.NewResponseController(w), timeout: idle}
 	if flusher != nil {
 		flusher.Flush()
 	}
+	note := ""
 
 	chatID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
@@ -765,7 +809,8 @@ func streamResponsesToChat(w http.ResponseWriter, ctx context.Context, live *liv
 			},
 		}
 		b, _ := json.Marshal(chunk)
-		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+		if _, err := fmt.Fprintf(downstream, "data: %s\n\n", b); err != nil {
+			note = "客户端写入超时或断开"
 			return false
 		}
 		if flusher != nil {
@@ -806,13 +851,13 @@ func streamResponsesToChat(w http.ResponseWriter, ctx context.Context, live *liv
 			if delta, _ := ev["delta"].(string); delta != "" {
 				sentText = true
 				if !writeChunk(map[string]any{"content": delta}, nil) {
-					return
+					return streamOutcome{bytes: downstream.written, note: note}
 				}
 			}
 		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 			if delta, _ := ev["delta"].(string); delta != "" {
 				if !writeChunk(map[string]any{"reasoning_content": delta}, nil) {
-					return
+					return streamOutcome{bytes: downstream.written, note: note}
 				}
 			}
 		case "response.output_item.added":
@@ -836,7 +881,7 @@ func streamResponsesToChat(w http.ResponseWriter, ctx context.Context, live *liv
 						},
 					}
 					if !writeChunk(tcDelta, nil) {
-						return
+						return streamOutcome{bytes: downstream.written, note: note}
 					}
 				}
 			}
@@ -857,7 +902,7 @@ func streamResponsesToChat(w http.ResponseWriter, ctx context.Context, live *liv
 					},
 				}
 				if !writeChunk(tcDelta, nil) {
-					return
+					return streamOutcome{bytes: downstream.written, note: note}
 				}
 			}
 		case "response.completed", "response.done":
@@ -866,7 +911,7 @@ func streamResponsesToChat(w http.ResponseWriter, ctx context.Context, live *liv
 					if fullText := extractCompletedResponseText(respObj); fullText != "" {
 						sentText = true
 						if !writeChunk(map[string]any{"content": fullText}, nil) {
-							return
+							return streamOutcome{bytes: downstream.written, note: note}
 						}
 					}
 				}
@@ -877,7 +922,7 @@ func streamResponsesToChat(w http.ResponseWriter, ctx context.Context, live *liv
 			}
 			finishSent = true
 			if !writeChunk(map[string]any{}, reason) {
-				return
+				return streamOutcome{bytes: downstream.written, note: note}
 			}
 		}
 	}
@@ -889,13 +934,20 @@ func streamResponsesToChat(w http.ResponseWriter, ctx context.Context, live *liv
 		}
 		_ = writeChunk(map[string]any{}, reason)
 	}
-	_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	_, _ = io.WriteString(downstream, "data: [DONE]\n\n")
 	if flusher != nil {
 		flusher.Flush()
 	}
-	if err := scanner.Err(); err != nil && ctx.Err() == nil {
-		log.Printf("[流] responses stream ended: %v", err)
+	switch {
+	case scanner.Err() != nil && ctx.Err() == nil:
+		log.Printf("[流] responses stream ended: %v", scanner.Err())
+		note = "上游中断"
+	case ctx.Err() != nil && note == "":
+		note = "客户端断开"
+	case scanner.Err() != nil:
+		note = "客户端断开"
 	}
+	return streamOutcome{bytes: downstream.written, note: note}
 }
 
 func aggregateResponsesToChat(response *gatewayResponse, deadline time.Time, model string) (*gatewayResponse, error) {

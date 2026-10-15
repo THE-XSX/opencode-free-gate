@@ -37,7 +37,7 @@ func TestOpenHTTPTimeoutClosesProxyConnection(t *testing.T) {
 
 	proxyURL, _ := url.Parse("http://" + listener.Addr().String())
 	started := time.Now()
-	_, err = openHTTP(context.Background(), http.MethodGet, "https://example.invalid/v1/models", http.Header{}, nil, proxyURL, 100*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond)
+	_, err = openHTTP(context.Background(), http.MethodGet, "https://example.invalid/v1/models", http.Header{}, nil, dialPlan{proxy: proxyURL}, 100*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond)
 	if !errors.Is(err, errAttemptTimeout) {
 		t.Fatalf("expected attempt timeout, got %v", err)
 	}
@@ -452,7 +452,28 @@ func newPoolStubGateway(t *testing.T, payload string, configure func(*config)) (
 	if configure != nil {
 		configure(&cfg)
 	}
-	return newGateway(cfg), &poolCalls
+	gw := newGateway(cfg)
+	// 请求路径只把补池放到后台，因此这里要提供后台补池所需的网关上下文。
+	ctx, cancel := context.WithCancel(context.Background())
+	gw.rootContext = ctx
+	t.Cleanup(func() {
+		cancel()
+		gw.direct.CloseIdleConnections()
+	})
+	return gw, &poolCalls
+}
+
+// waitForCondition 轮询等待条件成立，用于断言后台补池这类异步结果。
+func waitForCondition(t *testing.T, description string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", description)
 }
 
 func TestEmptyPoolBackoffSkipsRequestPathFetch(t *testing.T) {
@@ -470,7 +491,8 @@ func TestEmptyPoolBackoffSkipsRequestPathFetch(t *testing.T) {
 		cfg.poolEmptyBackoff = time.Minute
 	})
 
-	for attempt := 1; attempt <= 3; attempt++ {
+	dispatchDirect := func(attempt int) {
+		t.Helper()
 		response, err := gw.dispatch(context.Background(), upstreamRequest{
 			method:    http.MethodGet,
 			path:      "/v1/models",
@@ -486,14 +508,24 @@ func TestEmptyPoolBackoffSkipsRequestPathFetch(t *testing.T) {
 		}
 	}
 
+	// 第一次请求把补池交给后台，随后池被确认为空并进入退避窗口。
+	dispatchDirect(1)
+	waitForCondition(t, "the background refill to probe the empty pool", func() bool {
+		return poolCalls.Load() >= 1
+	})
+	if !gw.poolBackoffActive() {
+		t.Fatal("expected the empty pool to open the backoff window")
+	}
+
+	// 退避窗口内的请求不再拉池，直接走后备层。
+	dispatchDirect(2)
+	dispatchDirect(3)
+
 	if got := poolCalls.Load(); got != 1 {
 		t.Fatalf("empty pool should be fetched once and then backed off, got %d fetches", got)
 	}
 	if got := directCalls.Load(); got != 3 {
 		t.Fatalf("expected 3 direct fallbacks, got %d", got)
-	}
-	if !gw.poolBackoffActive() {
-		t.Fatal("expected the empty pool to open the backoff window")
 	}
 }
 
@@ -549,6 +581,9 @@ func TestPoolRecoveryClearsBackoffWindow(t *testing.T) {
 	// 后台刷新协程（启动期 10 秒重试 / PROXY_REFRESH_MS 周期）观察到池恢复后，
 	// 退避窗口必须立刻失效，让后续请求重新走公共代理层。
 	empty.Store(false)
+	gw.mu.Lock()
+	gw.candidatesLoadedAt = time.Now().Add(-candidateReloadDebounce)
+	gw.mu.Unlock()
 	if err := gw.loadCandidates(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
