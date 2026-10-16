@@ -290,7 +290,6 @@ func (a *app) handlePost(w http.ResponseWriter, r *http.Request, path string, de
 		upstreamStream = true
 
 		log.Printf("[协议自愈] 检测到模型 %s 不支持 Chat 协议，已自动记忆并无缝切换至 /v1/responses 重试", upstreamModel)
-		retryIDs := deriveRequestIDs(r.Header, nil)
 		headers.Set("X-Opencode-Request", randomID("req", 16))
 		response, err = a.gateway.dispatch(r.Context(), buildUpstreamReq(requestPath, requestBody, upstreamStream), trace)
 	}
