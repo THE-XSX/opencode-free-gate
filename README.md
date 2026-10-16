@@ -66,10 +66,11 @@ docker run -d \
 | `PORT` | `13339` | HTTP 监听端口 |
 | `PROXY_MODE` | `auto` | `auto` 使用完整回退链；`custom` 从自定义代理开始 |
 | `PROXY_ORDER` | 空 | 逗号分隔的回退顺序，取值 `public`、`zen`、`custom`（如 `custom,zen,public`）；设置后覆盖 `PROXY_MODE` 的默认顺序，省略的层会被跳过，直连始终作为最后兜底 |
-| `OPENCODE_UA` | 空（自动生成） | 显式锁定发送至上游的 `User-Agent`，例如 `opencode/2.0.29 (linux x64)` |
-| `OPENCODE_VERSION` | `2.0.29`（定时自动更新） | OpenCode 客户端版本号（同步注入 `x-opencode-version` 与 UA） |
+| `OPENCODE_API_KEY` | 空（默认使用公共 `Bearer public`） | OpenCode 官方 API Key / Zen Key；配置后直通上游认证，免除免费层客户端校验限制 |
+| `OPENCODE_UA` | 空（自动生成） | 显式锁定发送至上游的 `User-Agent`，默认纯规范 semver 如 `opencode/2.0.30` |
+| `OPENCODE_VERSION` | `2.0.30`（定时自动更新） | OpenCode 客户端版本号（同步注入 `x-opencode-version` 与 UA） |
 | `OPENCODE_CLIENT` | `cli` | 客户端类型（如 `cli`、`desktop`、`tui`） |
-| `OPENCODE_PLATFORM` | `linux x64` | 平台标识（如 `linux x64`、`darwin arm64`、`win32 x64`） |
+| `OPENCODE_PLATFORM` | 空（不附加平台后缀） | 平台标识（如 `linux x64`、`darwin arm64`、`win32 x64`） |
 | `OPENCODE_PROJECT` | `global` | 默认项目标识，设置 `global` 时向未传项目的请求上报 `global` |
 | `SLOT_COUNT` | `5` | 公共代理槽位数，限制为 3–5；并发请求从不同槽位轮询开始 |
 | `SLOT_RETRIES` | 槽位数 | 单请求最多尝试的公共代理数 |

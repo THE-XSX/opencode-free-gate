@@ -345,7 +345,18 @@ func (a *app) collectHeaders(source http.Header) http.Header {
 			result.Add(key, value)
 		}
 	}
-	if auth := a.gateway.cfg.project.upstreamAuthorization; auth != "" {
+	clientAuth := ""
+	if source != nil {
+		clientAuth = strings.TrimSpace(source.Get("Authorization"))
+		if clientAuth == "" {
+			if key := strings.TrimSpace(source.Get("X-Api-Key")); key != "" {
+				clientAuth = "Bearer " + key
+			}
+		}
+	}
+	if clientAuth != "" && !strings.EqualFold(clientAuth, "Bearer public") {
+		result.Set("Authorization", clientAuth)
+	} else if auth := a.gateway.cfg.project.upstreamAuthorization; auth != "" {
 		result.Set("Authorization", auth)
 	}
 	client := a.gateway.cfg.project.defaultClientHeader

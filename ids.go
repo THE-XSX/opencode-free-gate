@@ -201,15 +201,12 @@ func initClientFingerprint() {
 		currentVersion = defaultVersion
 	}
 
-	platform := defaultPlatform
-	if configuredPlatform != "" {
-		platform = configuredPlatform
-	}
-
 	if configuredUA != "" {
 		currentUA = configuredUA
+	} else if configuredPlatform != "" {
+		currentUA = fmt.Sprintf("opencode/%s (%s)", currentVersion, configuredPlatform)
 	} else {
-		currentUA = fmt.Sprintf("opencode/%s (%s)", currentVersion, platform)
+		currentUA = fmt.Sprintf("opencode/%s", currentVersion)
 	}
 }
 
@@ -265,11 +262,11 @@ func updateOpencodeUserAgent(version string) {
 	}
 
 	if configuredUA == "" {
-		platform := defaultPlatform
 		if configuredPlatform != "" {
-			platform = configuredPlatform
+			currentUA = fmt.Sprintf("opencode/%s (%s)", currentVersion, configuredPlatform)
+		} else {
+			currentUA = fmt.Sprintf("opencode/%s", currentVersion)
 		}
-		currentUA = fmt.Sprintf("opencode/%s (%s)", currentVersion, platform)
 	}
 	log.Printf("[UA] OpenCode 客户端指纹已自动同步为: %s (版本: %s)", currentUA, currentVersion)
 }

@@ -191,11 +191,13 @@ func TestClientFingerprintEnvOverrides(t *testing.T) {
 		t.Fatalf("expected UA opencode/2.1.0 (darwin arm64), got %q", got)
 	}
 
-	// Explicit OPENCODE_UA override
-	t.Setenv("OPENCODE_UA", "custom-opencode-agent/9.9.9")
+	// Clean semver UA when platform is not configured
+	t.Setenv("OPENCODE_UA", "")
+	t.Setenv("OPENCODE_PLATFORM", "")
+	t.Setenv("OPENCODE_VERSION", "2.0.30")
 	initClientFingerprint()
-	if got := opencodeUserAgent(); got != "custom-opencode-agent/9.9.9" {
-		t.Fatalf("expected custom UA override, got %q", got)
+	if got := opencodeUserAgent(); got != "opencode/2.0.30" {
+		t.Fatalf("expected clean semver UA opencode/2.0.30, got %q", got)
 	}
 }
 

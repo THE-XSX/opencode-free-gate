@@ -31,6 +31,15 @@ type projectSpec struct {
 }
 
 func currentProject() projectSpec {
+	upstreamAuth := "Bearer public"
+	if key := strings.TrimSpace(os.Getenv("OPENCODE_API_KEY")); key != "" {
+		if !strings.HasPrefix(strings.ToLower(key), "bearer ") {
+			upstreamAuth = "Bearer " + key
+		} else {
+			upstreamAuth = key
+		}
+	}
+
 	return projectSpec{
 		name:        "opencode-free-gate",
 		displayName: "OpenCode",
@@ -39,7 +48,7 @@ func currentProject() projectSpec {
 		modelPath:   "/v1/models",
 		probeHeaders: http.Header{
 			"Accept":             []string{"application/json"},
-			"Authorization":      []string{"Bearer public"},
+			"Authorization":      []string{upstreamAuth},
 			"User-Agent":         []string{opencodeUserAgent()},
 			"X-Opencode-Client":  []string{opencodeClient()},
 			"X-Opencode-Version": []string{opencodeVersion()},
@@ -58,7 +67,7 @@ func currentProject() projectSpec {
 			"/v1/messages":         {},
 			"/v1/responses":        {},
 		},
-		upstreamAuthorization: "Bearer public",
+		upstreamAuthorization: upstreamAuth,
 		defaultClientHeader:   opencodeClient(),
 		directFallback:        true,
 		modelMode:             modelOpenCode,

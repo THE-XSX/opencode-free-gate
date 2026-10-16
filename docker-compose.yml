@@ -8,6 +8,8 @@ services:
       - "13339:13339"
     environment:
       - PORT=13339
+      # OpenCode 官方 API 密钥（可选，配置后直通上游认证并免除免费层客户端校验）
+      # - OPENCODE_API_KEY=你的密钥
       # ZenProxy 备用中继（可选，全部代理失败时降级使用）
       # - ZENPROXY_KEY=你的密钥
       # - ZENPROXY_RELAY=https://zenproxy.top/api/relay
