@@ -291,7 +291,7 @@ func (a *app) handlePost(w http.ResponseWriter, r *http.Request, path string, de
 
 		log.Printf("[协议自愈] 检测到模型 %s 不支持 Chat 协议，已自动记忆并无缝切换至 /v1/responses 重试", upstreamModel)
 		retryIDs := deriveRequestIDs(r.Header, nil)
-		headers.Set("X-Opencode-Request", retryIDs.Request)
+		headers.Set("X-Opencode-Request", randomID("req", 16))
 		response, err = a.gateway.dispatch(r.Context(), buildUpstreamReq(requestPath, requestBody, upstreamStream), trace)
 	}
 
@@ -318,6 +318,7 @@ func applyRequestIDs(headers http.Header, ids requestIDs) {
 	headers.Set("X-Opencode-Session-Id", ids.Session)
 	headers.Set("X-Opencode-Request", ids.Request)
 	headers.Set("X-Opencode-Project", ids.Project)
+	headers.Set("X-Opencode-Version", opencodeVersion())
 	headers.Set("X-Session-Affinity", ids.Session)
 	headers.Set("X-Session-Id", ids.Session)
 }
@@ -348,9 +349,12 @@ func (a *app) collectHeaders(source http.Header) http.Header {
 	if auth := a.gateway.cfg.project.upstreamAuthorization; auth != "" {
 		result.Set("Authorization", auth)
 	}
-	if client := a.gateway.cfg.project.defaultClientHeader; client != "" {
-		result.Set("X-Opencode-Client", client)
+	client := a.gateway.cfg.project.defaultClientHeader
+	if client == "" {
+		client = opencodeClient()
 	}
+	result.Set("X-Opencode-Client", client)
+	result.Set("X-Opencode-Version", opencodeVersion())
 	result.Set("User-Agent", opencodeUserAgent())
 	if result.Get("Content-Type") == "" {
 		result.Set("Content-Type", "application/json")

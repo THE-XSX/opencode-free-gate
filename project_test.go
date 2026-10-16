@@ -34,6 +34,9 @@ func TestOpenCodeRoutesAndHeaders(t *testing.T) {
 	if got := headers.Get("User-Agent"); got != opencodeUserAgent() {
 		t.Fatalf("upstream requests must use the opencode user agent: %q", got)
 	}
+	if got := headers.Get("X-Opencode-Version"); got != opencodeVersion() {
+		t.Fatalf("upstream requests must carry x-opencode-version: %q", got)
+	}
 	if !project.directFallback {
 		t.Fatal("OpenCode must try one direct request after proxy retries are exhausted")
 	}

@@ -539,6 +539,8 @@ func (g *gateway) probe(ctx context.Context, candidate slot) bool {
 	deadline := time.Now().Add(g.cfg.probeTimeout)
 	headers := g.cfg.project.probeHeaders.Clone()
 	headers.Set("User-Agent", opencodeUserAgent())
+	headers.Set("X-Opencode-Client", opencodeClient())
+	headers.Set("X-Opencode-Version", opencodeVersion())
 	request := upstreamRequest{
 		method:   http.MethodGet,
 		path:     g.cfg.project.probePath,

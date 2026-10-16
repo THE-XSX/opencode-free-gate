@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -21,33 +22,79 @@ type requestIDs struct {
 }
 
 // deriveRequestIDs 生成上游 OpenCode 协议所需的会话、请求与项目标识。
-// 会话 ID 优先取客户端显式标识，否则用第一条用户消息生成稳定哈希，
-// 保证同一段多轮对话在历史增长时仍映射到同一个会话。
+// 会话 ID 优先透传客户端已有的合法 ses_ 格式标识，或根据显式会话信号 / 第一条用户消息生成稳定哈希；
+// 请求 ID 保留合法 req_/msg_ 标识或生成全新 ID；
+// 项目标识保留 global 或合法 prj_ 标识，未指定时消除网关特定特征并使用标准默认值。
 func deriveRequestIDs(headers http.Header, body map[string]any) requestIDs {
-	signal := firstString(
+	rawSession := firstString(
 		headers.Get("x-opencode-session"),
 		headers.Get("x-session-id"),
 		headers.Get("conversation-id"),
 		stringAt(body, "conversation_id"),
 		stringAt(body, "metadata", "session_id"),
 	)
-	if signal == "" {
-		signal = conversationSeed(body)
+
+	var sessionID string
+	if strings.HasPrefix(rawSession, "ses_") && len(rawSession) > 4 {
+		// 客户端显式传递了符合 OpenCode 格式的 session，直接透传保留
+		sessionID = rawSession
+	} else if rawSession != "" {
+		// 客户端传递了非 ses_ 格式的会话信号（如普通 uuid、conversation_id），生成稳定哈希
+		sessionID = stableID("ses", rawSession)
+	} else {
+		// 从消息历史中提取第一轮消息生成稳定会话哈希
+		seed := conversationSeed(body)
+		if seed == "" {
+			seed = stringAt(body, "previous_response_id")
+		}
+		if seed == "" || seed == "{}" {
+			sessionID = randomID("ses", 32)
+		} else {
+			sessionID = stableID("ses", seed)
+		}
 	}
-	if signal == "" {
-		signal = stringAt(body, "previous_response_id")
+
+	rawRequest := firstString(
+		headers.Get("x-opencode-request"),
+		headers.Get("x-request-id"),
+	)
+	var requestID string
+	if (strings.HasPrefix(rawRequest, "req_") || strings.HasPrefix(rawRequest, "msg_")) && len(rawRequest) > 4 {
+		requestID = rawRequest
+	} else {
+		requestID = randomID("req", 16)
 	}
-	if signal == "" || signal == "{}" {
-		signal = randomID("fallback", 16)
+
+	rawProject := firstString(
+		headers.Get("x-opencode-project"),
+		stringAt(body, "metadata", "project_id"),
+	)
+	var projectID string
+	if rawProject == "global" || (strings.HasPrefix(rawProject, "prj_") && len(rawProject) > 4) {
+		projectID = rawProject
+	} else if rawProject != "" {
+		projectID = stableID("prj", rawProject)
+	} else {
+		defaultPrj := opencodeDefaultProject()
+		if defaultPrj == "global" {
+			// 如果环境变量显式指定了 OPENCODE_PROJECT=global，则使用 "global"；
+			// 否则使用与 global 绑定的稳定 prj_ 哈希，保持与既有测试兼容
+			if strings.EqualFold(os.Getenv("OPENCODE_PROJECT"), "global") {
+				projectID = "global"
+			} else {
+				projectID = stableID("prj", "global")
+			}
+		} else if strings.HasPrefix(defaultPrj, "prj_") {
+			projectID = defaultPrj
+		} else {
+			projectID = stableID("prj", defaultPrj)
+		}
 	}
-	projectSignal := firstString(headers.Get("x-opencode-project"), stringAt(body, "metadata", "project_id"))
-	if projectSignal == "" {
-		projectSignal = "opencode-free-gate:default-project"
-	}
+
 	return requestIDs{
-		Session: stableID("ses", signal),
-		Request: randomID("req", 16),
-		Project: stableID("prj", projectSignal),
+		Session: sessionID,
+		Request: requestID,
+		Project: projectID,
 	}
 }
 
@@ -117,15 +164,83 @@ func stringAt(value map[string]any, path ...string) string {
 }
 
 var (
-	cachedUAMu     sync.RWMutex
-	cachedUA       = "opencode/2.0.29 (linux x64)"
-	lastFetchedVer string
+	clientMu           sync.RWMutex
+	defaultVersion     = "2.0.29"
+	defaultPlatform    = "linux x64"
+	defaultClientType  = "cli"
+	defaultProject     = "global"
+
+	configuredUA       string
+	configuredVersion  string
+	configuredClient   string
+	configuredPlatform string
+	configuredProject  string
+
+	currentVersion     string
+	currentUA          string
+	lastFetchedVer     string
 )
 
+func init() {
+	initClientFingerprint()
+}
+
+func initClientFingerprint() {
+	clientMu.Lock()
+	defer clientMu.Unlock()
+
+	configuredUA = strings.TrimSpace(os.Getenv("OPENCODE_UA"))
+	configuredVersion = strings.TrimSpace(os.Getenv("OPENCODE_VERSION"))
+	configuredClient = strings.TrimSpace(os.Getenv("OPENCODE_CLIENT"))
+	configuredPlatform = strings.TrimSpace(os.Getenv("OPENCODE_PLATFORM"))
+	configuredProject = strings.TrimSpace(os.Getenv("OPENCODE_PROJECT"))
+
+	if configuredVersion != "" {
+		currentVersion = configuredVersion
+	} else {
+		currentVersion = defaultVersion
+	}
+
+	platform := defaultPlatform
+	if configuredPlatform != "" {
+		platform = configuredPlatform
+	}
+
+	if configuredUA != "" {
+		currentUA = configuredUA
+	} else {
+		currentUA = fmt.Sprintf("opencode/%s (%s)", currentVersion, platform)
+	}
+}
+
 func opencodeUserAgent() string {
-	cachedUAMu.RLock()
-	defer cachedUAMu.RUnlock()
-	return cachedUA
+	clientMu.RLock()
+	defer clientMu.RUnlock()
+	return currentUA
+}
+
+func opencodeVersion() string {
+	clientMu.RLock()
+	defer clientMu.RUnlock()
+	return currentVersion
+}
+
+func opencodeClient() string {
+	clientMu.RLock()
+	defer clientMu.RUnlock()
+	if configuredClient != "" {
+		return configuredClient
+	}
+	return defaultClientType
+}
+
+func opencodeDefaultProject() string {
+	clientMu.RLock()
+	defer clientMu.RUnlock()
+	if configuredProject != "" {
+		return configuredProject
+	}
+	return defaultProject
 }
 
 func updateOpencodeUserAgent(version string) {
@@ -133,14 +248,30 @@ func updateOpencodeUserAgent(version string) {
 	if version == "" {
 		return
 	}
-	cachedUAMu.Lock()
-	defer cachedUAMu.Unlock()
+	clientMu.Lock()
+	defer clientMu.Unlock()
+
+	// 若用户通过环境变量锁定了版本和 UA，则不被定时拉取覆盖
+	if configuredVersion != "" && configuredUA != "" {
+		return
+	}
 	if version == lastFetchedVer {
 		return
 	}
 	lastFetchedVer = version
-	cachedUA = fmt.Sprintf("opencode/%s (linux x64)", version)
-	log.Printf("[UA] OpenCode 客户端指纹已自动同步为: %s", cachedUA)
+
+	if configuredVersion == "" {
+		currentVersion = version
+	}
+
+	if configuredUA == "" {
+		platform := defaultPlatform
+		if configuredPlatform != "" {
+			platform = configuredPlatform
+		}
+		currentUA = fmt.Sprintf("opencode/%s (%s)", currentVersion, platform)
+	}
+	log.Printf("[UA] OpenCode 客户端指纹已自动同步为: %s (版本: %s)", currentUA, currentVersion)
 }
 
 func fetchLatestOpencodeVersion(ctx context.Context) (string, error) {
@@ -152,6 +283,7 @@ func fetchLatestOpencodeVersion(ctx context.Context) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", opencodeUserAgent())
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -198,4 +330,5 @@ func startUAFetcher(ctx context.Context) {
 		}
 	}()
 }
+
 

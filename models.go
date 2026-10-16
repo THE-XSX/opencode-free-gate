@@ -150,7 +150,8 @@ func (g *gateway) fetchModelMaps(parent context.Context) (map[string]string, err
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", opencodeUserAgent())
-	req.Header.Set("X-Opencode-Client", "cli")
+	req.Header.Set("X-Opencode-Client", opencodeClient())
+	req.Header.Set("X-Opencode-Version", opencodeVersion())
 	if auth := g.cfg.project.upstreamAuthorization; auth != "" {
 		req.Header.Set("Authorization", auth)
 	}

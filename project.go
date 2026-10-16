@@ -38,10 +38,11 @@ func currentProject() projectSpec {
 		probePath:   "/v1/models",
 		modelPath:   "/v1/models",
 		probeHeaders: http.Header{
-			"Accept":            []string{"application/json"},
-			"Authorization":     []string{"Bearer public"},
-			"User-Agent":        []string{opencodeUserAgent()},
-			"X-Opencode-Client": []string{"cli"},
+			"Accept":             []string{"application/json"},
+			"Authorization":      []string{"Bearer public"},
+			"User-Agent":         []string{opencodeUserAgent()},
+			"X-Opencode-Client":  []string{opencodeClient()},
+			"X-Opencode-Version": []string{opencodeVersion()},
 		},
 		// x-opencode-* 头不再透传：客户端提供的会话/项目标识只作为
 		// deriveRequestIDs 的输入，最终由网关生成统一格式的标识发往上游。
@@ -58,7 +59,7 @@ func currentProject() projectSpec {
 			"/v1/responses":        {},
 		},
 		upstreamAuthorization: "Bearer public",
-		defaultClientHeader:   "cli",
+		defaultClientHeader:   opencodeClient(),
 		directFallback:        true,
 		modelMode:             modelOpenCode,
 		ownedBy:               "opencode",

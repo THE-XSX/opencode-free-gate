@@ -13,7 +13,7 @@
 - 流式请求在成功取得响应头后可继续传输；客户端断开、流长时间无数据、或客户端停止读取导致写入阻塞超过空闲上限时都会自动清理连接。完成日志在转发真正结束后输出，包含发送字节数与异常结束原因。
 - 普通业务 `400/404/422` 直接返回，不再无意义地轮换代理。
 - 支持公共 S 级代理、自定义代理和 ZenProxy relay 多级回退，回退顺序可通过 `PROXY_ORDER` 自定义。
-- 上游请求携带完整 OpenCode 客户端头：真实 `User-Agent`、`x-opencode-client`、稳定会话哈希 `x-opencode-session`、每请求唯一 `x-opencode-request`（同一请求的代理重试保持不变）与 `x-opencode-project`。
+- 上游请求携带完整 OpenCode 客户端头：真实且可自动更新的 `User-Agent`、`x-opencode-client`、`x-opencode-version`、稳定会话哈希 `x-opencode-session`、每请求唯一 `x-opencode-request`（同一请求的代理重试保持不变）与 `x-opencode-project`（透传已有合法 `ses_`/`req_`/`prj_` 标识并消除网关特征）。
 - `/v1/messages` 与真实 OpenCode 客户端一致，使用 `x-api-key` 认证并自动补齐 `anthropic-version`。
 - 同一会话优先固定同一代理出口（rendezvous 哈希亲和），减少匿名通道按出口 IP 限流带来的抖动；出口故障时自动回退到其他槽位。
 - 保留原有 Docker 镜像名、端口、路由和环境变量。
@@ -29,14 +29,15 @@
 
 模型缓存有效期为 60 秒：启动时异步预热，过期后由请求触发后台刷新并立即返回旧缓存。冷启动尚无缓存时，模型列表立即返回内置别名与 `big-pickle`，模型重写也只使用内置别名，不等待上游；刷新完成后展示完整免费模型列表并启用完整名称映射。并发请求共享同一次后台刷新。
 
-## 会话 ID
+## 会话与客户端标识
 
-网关为每个上游请求生成 OpenCode 协议要求的标识头，客户端无需自行构造：
+网关为每个上游请求生成符合 OpenCode 官方协议要求的标识头，客户端无需自行构造：
 
-- 优先使用客户端提供的 `x-opencode-session`、`x-session-id`、`conversation-id`、请求体 `conversation_id` 或 `metadata.session_id` 派生会话 ID。
-- 没有显式会话标识时，使用第一条用户消息（Responses 请求使用 `input` 或 `previous_response_id`）生成稳定会话哈希，同一段多轮对话始终映射到同一会话与同一代理出口。
-- 两个独立会话的第一条消息完全相同时，建议客户端发送不同的 `x-session-id` 以严格分离。
+- 优先透传客户端提供的合法 OpenCode 标识：若包含合法的 `ses_` 会话、`req_`/`msg_` 请求或 `prj_`/`global` 项目标识则直接保留，无需重复哈希。
+- 没有显式会话标识时，优先使用客户端提供的 `conversation-id`、请求体 `conversation_id`、`metadata.session_id`，或使用第一条用户消息（Responses 请求使用 `input` 或 `previous_response_id`）生成稳定会话哈希，同一段多轮对话始终映射到同一会话与同一代理出口。
+- 项目标识默认派生标准项目哈希（彻底消除任何网关特征字串），支持通过 `OPENCODE_PROJECT` 自定义或配置为 `global`。
 - `x-opencode-request` 每个客户端请求重新生成，同一请求内的代理重试保持不变。
+- 自动随上游请求携带 `x-opencode-version`，并支持后台定时同步最新官方发布版本。
 
 ## Docker 部署
 
@@ -65,6 +66,11 @@ docker run -d \
 | `PORT` | `13339` | HTTP 监听端口 |
 | `PROXY_MODE` | `auto` | `auto` 使用完整回退链；`custom` 从自定义代理开始 |
 | `PROXY_ORDER` | 空 | 逗号分隔的回退顺序，取值 `public`、`zen`、`custom`（如 `custom,zen,public`）；设置后覆盖 `PROXY_MODE` 的默认顺序，省略的层会被跳过，直连始终作为最后兜底 |
+| `OPENCODE_UA` | 空（自动生成） | 显式锁定发送至上游的 `User-Agent`，例如 `opencode/2.0.29 (linux x64)` |
+| `OPENCODE_VERSION` | `2.0.29`（定时自动更新） | OpenCode 客户端版本号（同步注入 `x-opencode-version` 与 UA） |
+| `OPENCODE_CLIENT` | `cli` | 客户端类型（如 `cli`、`desktop`、`tui`） |
+| `OPENCODE_PLATFORM` | `linux x64` | 平台标识（如 `linux x64`、`darwin arm64`、`win32 x64`） |
+| `OPENCODE_PROJECT` | `global` | 默认项目标识，设置 `global` 时向未传项目的请求上报 `global` |
 | `SLOT_COUNT` | `5` | 公共代理槽位数，限制为 3–5；并发请求从不同槽位轮询开始 |
 | `SLOT_RETRIES` | 槽位数 | 单请求最多尝试的公共代理数 |
 | `CUSTOM_PROXIES` | 空 | 逗号分隔的代理 URL，支持 HTTP、HTTPS、SOCKS5/SOCKS5H |

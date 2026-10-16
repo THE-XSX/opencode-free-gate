@@ -129,3 +129,73 @@ func TestSessionAffinityPrefersStableSlot(t *testing.T) {
 		t.Fatal("different sessions should spread across slots")
 	}
 }
+
+func TestDeriveRequestIDsPreservesValidOpenCodeIDs(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("X-Opencode-Session", "ses_custom_session_1234567890")
+	headers.Set("X-Opencode-Request", "req_custom_request_9876543210")
+	headers.Set("X-Opencode-Project", "global")
+
+	ids := deriveRequestIDs(headers, nil)
+	if ids.Session != "ses_custom_session_1234567890" {
+		t.Fatalf("expected preserved session id, got %q", ids.Session)
+	}
+	if ids.Request != "req_custom_request_9876543210" {
+		t.Fatalf("expected preserved request id, got %q", ids.Request)
+	}
+	if ids.Project != "global" {
+		t.Fatalf("expected preserved global project, got %q", ids.Project)
+	}
+
+	// Test msg_ request prefix and prj_ project prefix preservation
+	headers2 := http.Header{}
+	headers2.Set("X-Opencode-Session", "ses_turn_alpha")
+	headers2.Set("X-Opencode-Request", "msg_message_112233")
+	headers2.Set("X-Opencode-Project", "prj_my_workspace")
+
+	ids2 := deriveRequestIDs(headers2, nil)
+	if ids2.Session != "ses_turn_alpha" {
+		t.Fatalf("expected preserved session, got %q", ids2.Session)
+	}
+	if ids2.Request != "msg_message_112233" {
+		t.Fatalf("expected preserved msg_ request, got %q", ids2.Request)
+	}
+	if ids2.Project != "prj_my_workspace" {
+		t.Fatalf("expected preserved prj_ project, got %q", ids2.Project)
+	}
+}
+
+func TestClientFingerprintEnvOverrides(t *testing.T) {
+	t.Cleanup(func() {
+		initClientFingerprint()
+	})
+
+	t.Setenv("OPENCODE_VERSION", "2.1.0")
+	t.Setenv("OPENCODE_PLATFORM", "darwin arm64")
+	t.Setenv("OPENCODE_CLIENT", "desktop")
+	t.Setenv("OPENCODE_PROJECT", "global")
+	t.Setenv("OPENCODE_UA", "")
+
+	initClientFingerprint()
+
+	if got := opencodeVersion(); got != "2.1.0" {
+		t.Fatalf("expected version 2.1.0, got %q", got)
+	}
+	if got := opencodeClient(); got != "desktop" {
+		t.Fatalf("expected client desktop, got %q", got)
+	}
+	if got := opencodeDefaultProject(); got != "global" {
+		t.Fatalf("expected default project global, got %q", got)
+	}
+	if got := opencodeUserAgent(); got != "opencode/2.1.0 (darwin arm64)" {
+		t.Fatalf("expected UA opencode/2.1.0 (darwin arm64), got %q", got)
+	}
+
+	// Explicit OPENCODE_UA override
+	t.Setenv("OPENCODE_UA", "custom-opencode-agent/9.9.9")
+	initClientFingerprint()
+	if got := opencodeUserAgent(); got != "custom-opencode-agent/9.9.9" {
+		t.Fatalf("expected custom UA override, got %q", got)
+	}
+}
+
