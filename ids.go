@@ -118,24 +118,82 @@ func conversationSeed(body map[string]any) string {
 	return ""
 }
 
-func stableID(prefix, value string) string {
-	sum := sha256.Sum256([]byte(prefix + "\x00" + value))
-	if prefix == "ses" {
-		return prefix + "_" + hex.EncodeToString(sum[:])
+const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+func randomBase62(n int) string {
+	b := make([]byte, n)
+	randBuf := make([]byte, n)
+	if _, err := rand.Read(randBuf); err != nil {
+		for i := 0; i < n; i++ {
+			b[i] = base62Alphabet[time.Now().UnixNano()%int64(len(base62Alphabet))]
+		}
+		return string(b)
 	}
+	for i := 0; i < n; i++ {
+		b[i] = base62Alphabet[randBuf[i]%byte(len(base62Alphabet))]
+	}
+	return string(b)
+}
+
+// encodeOpencodeID 生成符合 OpenCode 客户端指纹的标识。
+// OpenCode 协议规定：
+// 会话 ID (ses_) 为 48-bit 递减时间戳 (0-63 计数器保证 low12 >= 0xfc0)，后接 14 位 base62 尾部；
+// 请求 ID (req_/msg_) 为 48-bit 递增时间戳，后接 14 位 base62 尾部。
+func encodeOpencodeID(prefix string, descending bool) string {
+	nowMs := time.Now().UnixMilli()
+	var counterBuf [1]byte
+	_, _ = rand.Read(counterBuf[:])
+	counter := int64(counterBuf[0] & 0x3F) // 0..63
+
+	val := nowMs*4096 + counter
+	if descending {
+		val = ^val
+	}
+	val = val & 0xFFFFFFFFFFFF
+
+	hexPart := fmt.Sprintf("%012x", val)
+	tail := randomBase62(14)
+	return fmt.Sprintf("%s_%s%s", prefix, hexPart, tail)
+}
+
+// stableOpencodeID 根据特定 seed (如用户消息内容或外部会话ID) 确定性生成符合格式的 ID，
+// 保证多次会话的 ID 既具备连续稳定性，又严格符合 OpenCode 的反脚本校验规则。
+func stableOpencodeID(prefix string, descending bool, seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	counter := int64(sum[0] & 0x3F) // 0..63
+	offset := (int64(sum[1])<<24 | int64(sum[2])<<16 | int64(sum[3])<<8 | int64(sum[4])) % 1000000000
+	ts := int64(1730000000000) + offset
+	val := ts*4096 + counter
+	if descending {
+		val = ^val
+	}
+	val = val & 0xFFFFFFFFFFFF
+
+	hexPart := fmt.Sprintf("%012x", val)
+	tail := make([]byte, 14)
+	for i := 0; i < 14; i++ {
+		tail[i] = base62Alphabet[sum[5+i]%byte(len(base62Alphabet))]
+	}
+	return fmt.Sprintf("%s_%s%s", prefix, hexPart, string(tail))
+}
+
+func stableID(prefix, value string) string {
+	if prefix == "ses" {
+		return stableOpencodeID(prefix, true, value)
+	}
+	sum := sha256.Sum256([]byte(prefix + "\x00" + value))
 	return prefix + "_" + hex.EncodeToString(sum[:12])
 }
 
 func randomID(prefix string, size int) string {
 	if prefix == "ses" {
-		size = 32
+		return encodeOpencodeID(prefix, true)
+	}
+	if prefix == "req" || prefix == "msg" {
+		return encodeOpencodeID(prefix, false)
 	}
 	buf := make([]byte, size)
 	if _, err := rand.Read(buf); err != nil {
-		if prefix == "ses" {
-			sum := sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
-			return prefix + "_" + hex.EncodeToString(sum[:])
-		}
 		return prefix + "_" + fmt.Sprintf("%x", time.Now().UnixNano())
 	}
 	return prefix + "_" + hex.EncodeToString(buf)

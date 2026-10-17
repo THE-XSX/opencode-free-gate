@@ -247,6 +247,13 @@ func (a *app) handlePost(w http.ResponseWriter, r *http.Request, path string, de
 		log.Printf("[协议桥接] %s: 命中规则，走 /v1/responses", upstreamModel)
 	} else if strings.HasPrefix(path, "/v1/responses") {
 		requestBody = sanitizeResponsesBody(body, payload)
+	} else if isChatPath {
+		// OpenCode Zen 的 /v1/chat/completions 对免费模型实施双重反脚本校验：
+		// 1. 请求体必须携带 OpenCode 内置的 4 个基础 Agent 工具 (bash, glob, grep, read)；
+		// 2. 上游接口强制必须为 stream: true，否则直接报 403 FreeTierError。
+		requestBody, payload = injectZenTools(requestBody, payload)
+		requestBody = ensureStream(requestBody, payload)
+		upstreamStream = true
 	}
 
 	headers := a.collectHeaders(r.Header)
@@ -307,6 +314,12 @@ func (a *app) handlePost(w http.ResponseWriter, r *http.Request, path string, de
 		} else {
 			return aggregateResponsesToChat(response, deadline, clientModel)
 		}
+	} else if isChatPath && !clientStream && upstreamStream && response.status >= 200 && response.status < 400 {
+		// 客户端显式请求非流式，但上游强制要求流式：在网关内部将 SSE 数据流聚合为完整 JSON 返回
+		if clientModel == "" {
+			clientModel = upstreamModel
+		}
+		return aggregateChatChunksToChat(response, deadline, clientModel)
 	}
 	return response, nil
 }
@@ -1087,3 +1100,218 @@ func extractCompletedResponseText(respObj map[string]any) string {
 	}
 	return sb.String()
 }
+
+var opencodeZenTools = []map[string]any{
+	{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "bash",
+			"description": "Execute a bash command in the terminal",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"command": map[string]any{"type": "string", "description": "The command to execute"},
+				},
+				"required": []string{"command"},
+			},
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "glob",
+			"description": "Fast file search using glob patterns",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"pattern": map[string]any{"type": "string", "description": "The glob pattern to match"},
+				},
+				"required": []string{"pattern"},
+			},
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "grep",
+			"description": "Fast content search using regex patterns",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"pattern": map[string]any{"type": "string", "description": "The regex pattern to search for"},
+				},
+				"required": []string{"pattern"},
+			},
+		},
+	},
+	{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "read",
+			"description": "Read file contents with line numbers",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"filePath": map[string]any{"type": "string", "description": "Path to the file to read"},
+				},
+				"required": []string{"filePath"},
+			},
+		},
+	},
+}
+
+func injectZenTools(body []byte, payload map[string]any) ([]byte, map[string]any) {
+	if payload == nil {
+		return body, payload
+	}
+	rawTools, hasTools := payload["tools"].([]any)
+	if !hasTools || len(rawTools) == 0 {
+		toolsCopy := make([]any, len(opencodeZenTools))
+		for i, t := range opencodeZenTools {
+			toolsCopy[i] = t
+		}
+		payload["tools"] = toolsCopy
+		if _, hasChoice := payload["tool_choice"]; !hasChoice {
+			payload["tool_choice"] = "none"
+		}
+	} else {
+		existingNames := make(map[string]bool)
+		for _, raw := range rawTools {
+			if tMap, ok := raw.(map[string]any); ok {
+				if fn, ok := tMap["function"].(map[string]any); ok {
+					if name, ok := fn["name"].(string); ok {
+						existingNames[name] = true
+					}
+				}
+			}
+		}
+		for _, tool := range opencodeZenTools {
+			if fn, ok := tool["function"].(map[string]any); ok {
+				name, _ := fn["name"].(string)
+				if !existingNames[name] {
+					rawTools = append(rawTools, tool)
+				}
+			}
+		}
+		payload["tools"] = rawTools
+	}
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return body, payload
+	}
+	return rewritten, payload
+}
+
+func aggregateChatChunksToChat(response *gatewayResponse, deadline time.Time, model string) (*gatewayResponse, error) {
+	var raw []byte
+	var err error
+	if response.live != nil {
+		raw, err = response.live.readAll(deadline)
+		response.live = nil
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		raw = response.body
+	}
+
+	var contentBuilder strings.Builder
+	var reasoningBuilder strings.Builder
+	var chunkID string
+	var created int64
+	var finishReason = "stop"
+	var usage map[string]any
+
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	scanner.Buffer(make([]byte, 64<<10), 4<<20)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		dataStr := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if dataStr == "" || dataStr == "[DONE]" {
+			continue
+		}
+		var chunk map[string]any
+		if json.Unmarshal([]byte(dataStr), &chunk) != nil {
+			continue
+		}
+		if id, ok := chunk["id"].(string); ok && id != "" {
+			chunkID = id
+		}
+		if c, ok := chunk["created"].(float64); ok && c > 0 {
+			created = int64(c)
+		}
+		if u, ok := chunk["usage"].(map[string]any); ok && len(u) > 0 {
+			usage = u
+		}
+		if choices, ok := chunk["choices"].([]any); ok && len(choices) > 0 {
+			if choice, ok := choices[0].(map[string]any); ok {
+				if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
+					finishReason = fr
+				}
+				if delta, ok := choice["delta"].(map[string]any); ok {
+					if c, ok := delta["content"].(string); ok && c != "" {
+						contentBuilder.WriteString(c)
+					}
+					if r, ok := delta["reasoning"].(string); ok && r != "" {
+						reasoningBuilder.WriteString(r)
+					}
+				}
+			}
+		}
+	}
+
+	if chunkID == "" {
+		chunkID = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	}
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+
+	message := map[string]any{
+		"role":    "assistant",
+		"content": contentBuilder.String(),
+	}
+	if reasoningBuilder.Len() > 0 {
+		message["reasoning_content"] = reasoningBuilder.String()
+	}
+
+	chatResp := map[string]any{
+		"id":      chunkID,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{
+			{
+				"index":         0,
+				"message":       message,
+				"finish_reason": finishReason,
+			},
+		},
+	}
+	if usage != nil {
+		chatResp["usage"] = usage
+	} else {
+		chatResp["usage"] = map[string]any{
+			"prompt_tokens":     0,
+			"completion_tokens": 0,
+			"total_tokens":      0,
+		}
+	}
+
+	body, err := json.Marshal(chatResp)
+	if err != nil {
+		return nil, err
+	}
+	header := response.header.Clone()
+	header.Set("Content-Type", "application/json; charset=utf-8")
+	header.Del("Content-Length")
+	return &gatewayResponse{
+		status: http.StatusOK,
+		header: header,
+		body:   body,
+	}, nil
+}
+
