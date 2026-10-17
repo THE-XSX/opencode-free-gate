@@ -190,7 +190,11 @@ func (g *gateway) fetchModelMaps(parent context.Context) (map[string]string, err
 			rename[id] = parts[len(parts)-1]
 		case modelOpenCode:
 			if strings.HasSuffix(id, "-free") {
-				rename[id] = strings.TrimSuffix(id, "-free")
+				name := strings.TrimSuffix(id, "-free")
+				if strings.HasPrefix(name, "jev") {
+					continue
+				}
+				rename[id] = name
 			}
 		}
 	}
@@ -280,6 +284,9 @@ func (g *gateway) rewriteModel(ctx context.Context, body []byte) []byte {
 			exists = true
 		case "deepseek-v4.1", "deepseek-v4-flash":
 			upstream = "deepseek-v4.1-flash-free"
+			exists = true
+		case "jev", "jev-1.13":
+			upstream = "mimo-v2.6-flash-free"
 			exists = true
 		}
 	}
