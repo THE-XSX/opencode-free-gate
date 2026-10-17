@@ -1092,6 +1092,9 @@ func (g *gateway) dispatchPublicLayer(ctx context.Context, request upstreamReque
 		if shouldDropSlot(response.status, response.body) {
 			g.dropSlot(candidate.addr)
 		}
+		if response.status == http.StatusTooManyRequests {
+			time.Sleep(500 * time.Millisecond)
+		}
 		last = response
 		lastProxy = candidate.addr
 	}
@@ -1223,6 +1226,13 @@ func (g *gateway) dispatchDirect(ctx context.Context, request upstreamRequest, t
 	if err != nil {
 		return nil, err
 	}
+	if response != nil && response.status == http.StatusTooManyRequests && time.Until(request.deadline) > 2*time.Second {
+		log.Printf("[直连] 触发 429 限流/端点繁忙，退避 800ms 后重试一次...")
+		time.Sleep(800 * time.Millisecond)
+		if r2, err2 := g.perform(ctx, request, nil); err2 == nil && r2 != nil {
+			response = r2
+		}
+	}
 	trace.finalProxy = "direct"
 	return response, nil
 }
@@ -1277,6 +1287,9 @@ func retryableStatus(status int) bool {
 // shouldDropSlot 当上游返回包含明确业务 error JSON 的 500 时（模型自身偶发异常而非代理故障），保留健康代理槽位。
 func shouldDropSlot(status int, body []byte) bool {
 	if status == http.StatusInternalServerError && len(body) > 0 && bytes.Contains(body, []byte(`"error"`)) {
+		return false
+	}
+	if status == http.StatusTooManyRequests {
 		return false
 	}
 	return retryableStatus(status)
