@@ -76,7 +76,10 @@ func currentProject() projectSpec {
 		directFallback:        true,
 		modelMode:             modelOpenCode,
 		ownedBy:               "opencode",
-		extraModels:           []string{"big-pickle"},
+		extraModels: []string{
+			"big-pickle",
+			"nemotron-3-ultra",
+		},
 		specialModels: map[string]string{
 			"muse-spark-1.3-contributor-free": "muse-spark-1.3-contributor",
 		},

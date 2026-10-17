@@ -268,6 +268,22 @@ func (g *gateway) rewriteModel(ctx context.Context, body []byte) []byte {
 	model, _ := payload["model"].(string)
 	upstream, exists := redirect[model]
 	if !exists {
+		switch strings.ToLower(strings.TrimSpace(model)) {
+		case "nemotron-3-ultra", "nemotron-3.5-ultra", "nemotron-ultra", "nemotron":
+			upstream = "nemotron-3.5-super-vl-free"
+			exists = true
+		case "mimo", "mimo-v2.6":
+			upstream = "mimo-v2.6-flash-free"
+			exists = true
+		case "glm-5.3", "glm-5.3-chat":
+			upstream = "glm-5.3-flash-free"
+			exists = true
+		case "deepseek-v4.1", "deepseek-v4-flash":
+			upstream = "deepseek-v4.1-flash-free"
+			exists = true
+		}
+	}
+	if !exists {
 		return body
 	}
 	payload["model"] = upstream
