@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -498,6 +499,9 @@ func writeGatewayResponse(w http.ResponseWriter, r *http.Request, response *gate
 		if w.Header().Get("Cache-Control") == "" {
 			w.Header().Set("Cache-Control", "no-cache")
 		}
+	} else {
+		w.Header().Del("Content-Length")
+		w.Header().Set("Content-Length", strconv.Itoa(len(response.body)))
 	}
 	if w.Header().Get("Content-Type") == "" {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -523,6 +527,8 @@ func streamResponse(w http.ResponseWriter, ctx context.Context, live *liveRespon
 	if flusher != nil {
 		flusher.Flush()
 	}
+	isEventStream := strings.Contains(strings.ToLower(w.Header().Get("Content-Type")), "text/event-stream")
+	seenDone := false
 	buffer := make([]byte, 32<<10)
 	for {
 		idleElapsed := make(chan struct{})
@@ -533,6 +539,9 @@ func streamResponse(w http.ResponseWriter, ctx context.Context, live *liveRespon
 		n, err := live.response.Body.Read(buffer)
 		stopped := timer.Stop()
 		if n > 0 {
+			if isEventStream && bytes.Contains(buffer[:n], []byte("[DONE]")) {
+				seenDone = true
+			}
 			if _, writeErr := downstream.Write(buffer[:n]); writeErr != nil {
 				return streamOutcome{bytes: downstream.written, note: "客户端写入超时或断开"}
 			}
@@ -548,6 +557,12 @@ func streamResponse(w http.ResponseWriter, ctx context.Context, live *liveRespon
 		if err != nil {
 			switch {
 			case errors.Is(err, io.EOF):
+				if isEventStream && !seenDone && downstream.written > 0 {
+					_, _ = io.WriteString(downstream, "\n\ndata: [DONE]\n\n")
+					if flusher != nil {
+						flusher.Flush()
+					}
+				}
 				return streamOutcome{bytes: downstream.written}
 			case ctx.Err() != nil:
 				return streamOutcome{bytes: downstream.written, note: "客户端断开"}
