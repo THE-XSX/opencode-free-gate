@@ -1228,6 +1228,13 @@ func (g *gateway) dispatchPublicLayer(ctx context.Context, request upstreamReque
 			g.dropSlot(candidate.addr)
 			continue
 		}
+		if isProxyResponse(response.status, response.header, response.body) {
+			log.Printf("[错页] %s 返回非API响应 (HTML/代理错误页，状态码 %d)，废弃并重试", candidate.addr, response.status)
+			g.dropSlot(candidate.addr)
+			last = response
+			lastProxy = candidate.addr
+			continue
+		}
 		if !retryableStatus(response.status) {
 			trace.finalProxy = candidate.addr
 			return response, nil
@@ -1272,6 +1279,12 @@ func (g *gateway) dispatchCustomLayer(ctx context.Context, request upstreamReque
 				return nil, err
 			}
 			log.Printf("[错] %s: %v", candidate.addr, err)
+			continue
+		}
+		if isProxyResponse(response.status, response.header, response.body) {
+			log.Printf("[错页] 自定义代理 %s 返回非API响应 (HTML/代理错误页，状态码 %d)，重试", candidate.addr, response.status)
+			last = response
+			lastProxy = candidate.addr
 			continue
 		}
 		if !retryableStatus(response.status) {
@@ -1437,6 +1450,22 @@ func shouldDropSlot(status int, body []byte) bool {
 		return false
 	}
 	return retryableStatus(status)
+}
+
+// isProxyResponse 检测响应是否为代理服务器返回的错误页、蜜罐回显或非 API HTML 响应。
+func isProxyResponse(status int, header http.Header, body []byte) bool {
+	ct := strings.ToLower(header.Get("Content-Type"))
+	if strings.Contains(ct, "text/html") {
+		return true
+	}
+	trimmed := bytes.TrimSpace(body)
+	if bytes.HasPrefix(trimmed, []byte("<!DOCTYPE")) || bytes.HasPrefix(trimmed, []byte("<html")) {
+		return true
+	}
+	if bytes.Contains(trimmed, []byte("REMOTE_ADDR")) || bytes.Contains(trimmed, []byte("REQUEST_METHOD")) {
+		return true
+	}
+	return false
 }
 
 func jsonGatewayResponse(status int, message string) *gatewayResponse {
