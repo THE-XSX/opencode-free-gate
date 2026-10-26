@@ -594,3 +594,38 @@ func TestPoolRecoveryClearsBackoffWindow(t *testing.T) {
 		t.Fatalf("expected 1 candidate, got %d", got)
 	}
 }
+
+func TestParseProxyAPIResponse(t *testing.T) {
+	// 1. proxy.scdn.io format
+	scdnJSON := []byte(`{"code":200,"message":"success","data":{"proxies":["1.2.3.4:8080","5.6.7.8:3128"],"count":2}}`)
+	items := parseProxyAPIResponse(scdnJSON, "http")
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items from scdn json, got %d", len(items))
+	}
+	if items[0].Address != "1.2.3.4:8080" || items[0].Protocol != "http" || items[0].QualityGrade != "S" {
+		t.Fatalf("unexpected item 0: %+v", items[0])
+	}
+
+	// 2. Plain text format
+	txt := []byte("10.0.0.1:8080\nsocks5://10.0.0.2:1080\n# comment\n")
+	items = parseProxyAPIResponse(txt, "http")
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items from text, got %d", len(items))
+	}
+	if items[0].Address != "10.0.0.1:8080" || items[0].Protocol != "http" {
+		t.Fatalf("unexpected text item 0: %+v", items[0])
+	}
+	if items[1].Address != "10.0.0.2:1080" || items[1].Protocol != "socks5" {
+		t.Fatalf("unexpected text item 1: %+v", items[1])
+	}
+
+	// 3. Legacy amux.ai format
+	legacyJSON := []byte(`[{"address":"192.168.1.1:8080","protocol":"http","quality_grade":"A","status":"active"}]`)
+	items = parseProxyAPIResponse(legacyJSON, "http")
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item from legacy json, got %d", len(items))
+	}
+	if items[0].QualityGrade != "A" {
+		t.Fatalf("unexpected quality grade: %+v", items[0])
+	}
+}

@@ -221,37 +221,63 @@ func (g *gateway) loadCandidates(parent context.Context) (resultErr error) {
 		g.mu.Unlock()
 	}()
 
-	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.cfg.proxyAPI, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
-
+	endpoints := strings.Split(g.cfg.proxyAPI, ",")
 	client := &http.Client{Transport: controlTransport(5 * time.Second)}
 	defer client.CloseIdleConnections()
-	res, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return fmt.Errorf("proxy API returned %d", res.StatusCode)
-	}
 
 	var all []proxyItem
-	if err := json.NewDecoder(io.LimitReader(res.Body, 4<<20)).Decode(&all); err != nil {
-		return err
+	seen := make(map[string]struct{})
+
+	for _, endpoint := range endpoints {
+		endpoint = strings.TrimSpace(endpoint)
+		if endpoint == "" {
+			continue
+		}
+		defaultProto := "http"
+		lower := strings.ToLower(endpoint)
+		if strings.Contains(lower, "protocol=socks5") || strings.Contains(lower, "protocol=socks4") {
+			defaultProto = "socks5"
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("User-Agent", "curl/8.5.0")
+
+		res, err := client.Do(req)
+		if err != nil {
+			log.Printf("[候选] 拉取代理源失败 %s: %v", endpoint, err)
+			continue
+		}
+		body, readErr := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+		res.Body.Close()
+		if readErr != nil || res.StatusCode < 200 || res.StatusCode >= 300 {
+			log.Printf("[候选] 代理源 %s 响应异常 (%d)", endpoint, res.StatusCode)
+			continue
+		}
+
+		items := parseProxyAPIResponse(body, defaultProto)
+		for _, item := range items {
+			key := item.Protocol + "://" + item.Address
+			if _, exists := seen[key]; !exists {
+				seen[key] = struct{}{}
+				all = append(all, item)
+			}
+		}
 	}
+
 	var sGrade, aGrade, bGrade []proxyItem
 	for _, item := range all {
-		if item.Status != "active" {
+		if item.Status != "" && item.Status != "active" {
 			continue
 		}
 		switch strings.ToUpper(strings.TrimSpace(item.QualityGrade)) {
-		case "S":
+		case "S", "":
 			sGrade = append(sGrade, item)
 		case "A", "A+":
 			aGrade = append(aGrade, item)
@@ -274,6 +300,100 @@ func (g *gateway) loadCandidates(parent context.Context) (resultErr error) {
 	log.Printf("[选] 从池获取到 %d 个原始代理 -> %d 个候选 (%d S级, %d A级, %d B级)", len(all), len(filtered), len(sGrade), len(aGrade), len(bGrade))
 	g.notePoolResult(len(all), len(filtered))
 	return nil
+}
+
+type scdnEnvelope struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    struct {
+		Proxies []string `json:"proxies"`
+		Count   int      `json:"count"`
+	} `json:"data"`
+	Proxies []string `json:"proxies"`
+}
+
+func parseProxyAPIResponse(body []byte, defaultProto string) []proxyItem {
+	bodyStr := strings.TrimSpace(string(body))
+	if bodyStr == "" || bodyStr == "null" {
+		return nil
+	}
+
+	// 1. 兼容原有 amux.ai 对象数组格式: [{"address":"...", "protocol":"http", ...}]
+	var legacy []proxyItem
+	if err := json.Unmarshal(body, &legacy); err == nil && len(legacy) > 0 && legacy[0].Address != "" {
+		return legacy
+	}
+
+	// 2. 兼容 proxy.scdn.io JSON 对象格式: {"code":200, "data":{"proxies":["ip:port",...]}}
+	var env scdnEnvelope
+	if err := json.Unmarshal(body, &env); err == nil {
+		list := env.Data.Proxies
+		if len(list) == 0 {
+			list = env.Proxies
+		}
+		if len(list) > 0 {
+			var items []proxyItem
+			for _, s := range list {
+				if item, ok := makeCandidateItem(s, defaultProto); ok {
+					items = append(items, item)
+				}
+			}
+			if len(items) > 0 {
+				return items
+			}
+		}
+	}
+
+	// 3. 兼容纯 JSON 字符串数组: ["ip:port", ...]
+	var strList []string
+	if err := json.Unmarshal(body, &strList); err == nil && len(strList) > 0 {
+		var items []proxyItem
+		for _, s := range strList {
+			if item, ok := makeCandidateItem(s, defaultProto); ok {
+				items = append(items, item)
+			}
+		}
+		if len(items) > 0 {
+			return items
+		}
+	}
+
+	// 4. 兼容纯文本逐行格式（如 proxy.scdn.io/text.php）
+	lines := strings.Split(bodyStr, "\n")
+	var items []proxyItem
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if item, ok := makeCandidateItem(line, defaultProto); ok {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func makeCandidateItem(raw, defaultProto string) (proxyItem, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return proxyItem{}, false
+	}
+	proto := defaultProto
+	addr := raw
+	if strings.Contains(raw, "://") {
+		parts := strings.SplitN(raw, "://", 2)
+		proto = parts[0]
+		addr = parts[1]
+	}
+	if proto == "" {
+		proto = "http"
+	}
+	return proxyItem{
+		Address:      addr,
+		Protocol:     proto,
+		QualityGrade: "S",
+		Status:       "active",
+	}, true
 }
 
 // poolBackoffActive 报告公共池是否处于"空池退避"窗口内。上游池处于 emergency
@@ -372,12 +492,17 @@ func (g *gateway) fillSlots(ctx context.Context) error {
 		return nil
 	}
 
-	batch := g.takeCandidates(needed + 3)
-	if len(batch) == 0 {
-		if err := g.loadCandidates(ctx); err != nil {
+	batchCount := needed * 5
+	if batchCount < 20 {
+		batchCount = 20
+	}
+	batch := g.takeCandidates(batchCount)
+	if len(batch) < needed {
+		if err := g.loadCandidates(ctx); err != nil && len(batch) == 0 {
 			return err
 		}
-		batch = g.takeCandidates(needed + 3)
+		more := g.takeCandidates(batchCount - len(batch))
+		batch = append(batch, more...)
 	}
 	if len(batch) == 0 {
 		return errNoProxy
@@ -551,9 +676,19 @@ func (g *gateway) probe(ctx context.Context, candidate slot) bool {
 	if err != nil {
 		return false
 	}
+	defer live.Close()
 	status := live.response.StatusCode
-	live.Close()
-	return status >= 200 && status < 400
+	if status < 200 || status >= 400 {
+		return false
+	}
+	buf := make([]byte, 512)
+	n, _ := io.ReadFull(live.response.Body, buf)
+	bodySample := string(buf[:n])
+	// 剔除蜜罐回显与代理自身错误页 (如部分公开代理回显客户端请求)
+	if strings.Contains(bodySample, "REMOTE_ADDR") || strings.Contains(bodySample, "REQUEST_METHOD") {
+		return false
+	}
+	return true
 }
 
 func (g *gateway) takeCandidates(limit int) []proxyItem {

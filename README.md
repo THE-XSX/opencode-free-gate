@@ -66,6 +66,7 @@ docker run -d \
 | `PORT` | `13339` | HTTP 监听端口 |
 | `PROXY_MODE` | `auto` | `auto` 使用完整回退链；`custom` 从自定义代理开始 |
 | `PROXY_ORDER` | 空 | 逗号分隔的回退顺序，取值 `public`、`zen`、`custom`（如 `custom,zen,public`）；设置后覆盖 `PROXY_MODE` 的默认顺序，省略的层会被跳过，直连始终作为最后兜底 |
+| `PROXY_API` | `https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=100,https://proxy.scdn.io/api/get_proxy.php?protocol=socks5&count=100` | 公共代理候选池接口，支持 proxy.scdn.io、纯文本按行列表或 amux.ai 等格式，多个逗号分隔 |
 | `OPENCODE_API_KEY` | 空（默认使用公共 `Bearer public`） | OpenCode 官方 API Key / Zen Key；配置后直通上游认证，免除免费层客户端校验限制 |
 | `OPENCODE_UPSTREAM` | `https://opencode.ai/inference/openai` | OpenCode 官方推理上游地址（支持自定义覆盖） |
 | `OPENCODE_UA` | 空（自动生成） | 显式锁定发送至上游的 `User-Agent`，默认纯规范 semver 如 `opencode/2.1.4` |

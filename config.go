@@ -55,7 +55,7 @@ func loadConfig(project projectSpec) config {
 	return config{
 		project:          project,
 		port:             envInt("PORT", 13339),
-		proxyAPI:         envString("PROXY_API", "https://proxy.amux.ai/api/proxies?limit=100"),
+		proxyAPI:         envString("PROXY_API", "https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=100,https://proxy.scdn.io/api/get_proxy.php?protocol=socks5&count=100"),
 		proxyMode:        mode,
 		proxyOrder:       parseProxyOrder(os.Getenv("PROXY_ORDER")),
 		slotCount:        slotCount,
