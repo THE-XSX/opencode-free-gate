@@ -1458,6 +1458,9 @@ func isProxyResponse(status int, header http.Header, body []byte) bool {
 	if strings.Contains(ct, "text/html") {
 		return true
 	}
+	if status >= 400 && !strings.Contains(ct, "json") && !strings.Contains(ct, "event-stream") {
+		return true
+	}
 	trimmed := bytes.TrimSpace(body)
 	if bytes.HasPrefix(trimmed, []byte("<!DOCTYPE")) || bytes.HasPrefix(trimmed, []byte("<html")) {
 		return true
