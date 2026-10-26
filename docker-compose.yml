@@ -21,8 +21,8 @@ services:
       # - FORCE_RELAY=0
       # 探活超时（ms）
       # - PROXY_PROBE_TIMEOUT=8000
-      # 公共代理源（默认集成 proxy.scdn.io 高可用 SOCKS5 代理池）
-      # - PROXY_API=https://proxy.scdn.io/api/get_proxy.php?protocol=socks5&count=100
+      # 公共代理源（默认集成 proxy.scdn.io 代理池，支持 get_proxy.php 与 text.php，可逗号分隔多源）
+      # - PROXY_API=https://proxy.scdn.io/api/get_proxy.php?protocol=all&count=100,https://proxy.scdn.io/text.php
       # 候选池刷新间隔（ms，5 分钟）
       # - PROXY_REFRESH_MS=300000
     healthcheck:
