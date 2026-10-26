@@ -682,14 +682,28 @@ func (g *gateway) probe(ctx context.Context, candidate slot) bool {
 	}
 	defer live.Close()
 	status := live.response.StatusCode
-	if status < 200 || status >= 400 {
+	if status < 200 || status >= 300 {
+		return false
+	}
+	ct := strings.ToLower(live.response.Header.Get("Content-Type"))
+	if !strings.Contains(ct, "json") {
 		return false
 	}
 	buf := make([]byte, 512)
 	n, _ := io.ReadFull(live.response.Body, buf)
-	bodySample := string(buf[:n])
-	// 剔除蜜罐回显与代理自身错误页 (如部分公开代理回显客户端请求)
-	if strings.Contains(bodySample, "REMOTE_ADDR") || strings.Contains(bodySample, "REQUEST_METHOD") {
+	if n == 0 {
+		return false
+	}
+	sample := buf[:n]
+	if isProxyResponse(status, live.response.Header, sample) {
+		return false
+	}
+	trimmed := bytes.TrimSpace(sample)
+	if !bytes.HasPrefix(trimmed, []byte("{")) && !bytes.HasPrefix(trimmed, []byte("[")) {
+		return false
+	}
+	bodySample := string(sample)
+	if !strings.Contains(bodySample, "data") && !strings.Contains(bodySample, "models") && !strings.Contains(bodySample, "object") {
 		return false
 	}
 	return true
@@ -1231,8 +1245,6 @@ func (g *gateway) dispatchPublicLayer(ctx context.Context, request upstreamReque
 		if isProxyResponse(response.status, response.header, response.body) {
 			log.Printf("[错页] %s 返回非API响应 (HTML/代理错误页，状态码 %d)，废弃并重试", candidate.addr, response.status)
 			g.dropSlot(candidate.addr)
-			last = response
-			lastProxy = candidate.addr
 			continue
 		}
 		if !retryableStatus(response.status) {
@@ -1283,8 +1295,6 @@ func (g *gateway) dispatchCustomLayer(ctx context.Context, request upstreamReque
 		}
 		if isProxyResponse(response.status, response.header, response.body) {
 			log.Printf("[错页] 自定义代理 %s 返回非API响应 (HTML/代理错误页，状态码 %d)，重试", candidate.addr, response.status)
-			last = response
-			lastProxy = candidate.addr
 			continue
 		}
 		if !retryableStatus(response.status) {
@@ -1465,7 +1475,13 @@ func isProxyResponse(status int, header http.Header, body []byte) bool {
 	if bytes.HasPrefix(trimmed, []byte("<!DOCTYPE")) || bytes.HasPrefix(trimmed, []byte("<html")) {
 		return true
 	}
+	if bytes.Contains(trimmed, []byte("<head")) || bytes.Contains(trimmed, []byte("<body")) {
+		return true
+	}
 	if bytes.Contains(trimmed, []byte("REMOTE_ADDR")) || bytes.Contains(trimmed, []byte("REQUEST_METHOD")) {
+		return true
+	}
+	if bytes.Contains(trimmed, []byte("Connection established")) {
 		return true
 	}
 	return false
