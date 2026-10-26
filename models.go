@@ -143,7 +143,10 @@ func (g *gateway) fetchModelMaps(parent context.Context) (map[string]string, err
 	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
 	defer cancel()
 
-	target := strings.TrimRight(g.cfg.project.upstream, "/") + g.cfg.project.modelPath
+	target := g.cfg.project.modelPath
+	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
+		target = strings.TrimRight(g.cfg.project.upstream, "/") + target
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err

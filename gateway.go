@@ -786,6 +786,11 @@ func (r *liveResponse) readAll(deadline time.Time) ([]byte, error) {
 
 func (g *gateway) openUpstream(ctx context.Context, request upstreamRequest, proxyURL *url.URL, maxWait time.Duration) (*liveResponse, error) {
 	target := strings.TrimRight(g.cfg.project.upstream, "/") + request.path
+	if strings.HasPrefix(request.path, "http://") || strings.HasPrefix(request.path, "https://") {
+		target = request.path
+	} else if request.path == "/v1/messages" && strings.HasSuffix(g.cfg.project.upstream, "/inference/openai") {
+		target = strings.TrimSuffix(g.cfg.project.upstream, "/openai") + request.path
+	}
 	wait, connectTimeout, responseHeaderTimeout := g.openTimeouts(request.deadline, maxWait)
 	plan := dialPlan{shared: g.direct}
 	if proxyURL != nil {

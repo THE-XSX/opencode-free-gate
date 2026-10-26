@@ -44,12 +44,17 @@ func currentProject() projectSpec {
 		}
 	}
 
+	upstreamURL := "https://opencode.ai/inference/openai"
+	if custom := strings.TrimSpace(os.Getenv("OPENCODE_UPSTREAM")); custom != "" {
+		upstreamURL = strings.TrimRight(custom, "/")
+	}
+
 	return projectSpec{
 		name:        "opencode-free-gate",
 		displayName: "OpenCode",
-		upstream:    "https://opencode.ai/zen",
-		probePath:   "/v1/models",
-		modelPath:   "/v1/models",
+		upstream:    upstreamURL,
+		probePath:   "https://opencode.ai/inference/v1/models",
+		modelPath:   "https://opencode.ai/inference/v1/models",
 		probeHeaders: http.Header{
 			"Accept":             []string{"application/json"},
 			"Authorization":      []string{upstreamAuth},

@@ -157,12 +157,15 @@ func encodeOpencodeID(prefix string, descending bool) string {
 }
 
 // stableOpencodeID 根据特定 seed (如用户消息内容或外部会话ID) 确定性生成符合格式的 ID，
-// 保证多次会话的 ID 既具备连续稳定性，又严格符合 OpenCode 的反脚本校验规则。
+// 保证多次会话的 ID 既具备连续稳定性，又严格符合 OpenCode 的反脚本校验规则（嵌入动态滑动毫秒戳，确保时效性）。
 func stableOpencodeID(prefix string, descending bool, seed string) string {
 	sum := sha256.Sum256([]byte(seed))
 	counter := int64(sum[0] & 0x3F) // 0..63
-	offset := (int64(sum[1])<<24 | int64(sum[2])<<16 | int64(sum[3])<<8 | int64(sum[4])) % 1000000000
-	ts := int64(1730000000000) + offset
+	nowMs := time.Now().UnixMilli()
+	const windowMs = int64(10 * 60 * 1000) // 10 分钟滑动窗口
+	baseTs := (nowMs / windowMs) * windowMs
+	offset := (int64(sum[1])<<16 | int64(sum[2])<<8 | int64(sum[3])) % (windowMs / 2)
+	ts := baseTs + offset
 	val := ts*4096 + counter
 	if descending {
 		val = ^val
@@ -172,7 +175,7 @@ func stableOpencodeID(prefix string, descending bool, seed string) string {
 	hexPart := fmt.Sprintf("%012x", val)
 	tail := make([]byte, 14)
 	for i := 0; i < 14; i++ {
-		tail[i] = base62Alphabet[sum[5+i]%byte(len(base62Alphabet))]
+		tail[i] = base62Alphabet[sum[4+i]%byte(len(base62Alphabet))]
 	}
 	return fmt.Sprintf("%s_%s%s", prefix, hexPart, string(tail))
 }
@@ -223,7 +226,7 @@ func stringAt(value map[string]any, path ...string) string {
 
 var (
 	clientMu           sync.RWMutex
-	defaultVersion     = "2.0.29"
+	defaultVersion     = "2.1.4"
 	defaultPlatform    = "linux x64"
 	defaultClientType  = "cli"
 	defaultProject     = "global"
