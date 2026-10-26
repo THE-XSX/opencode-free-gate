@@ -30,7 +30,8 @@ COPY --from=build --chown=app:app /out/gate /app/gate
 
 USER app
 
-ENV PORT=13339
+ENV PORT=13339 \
+    GODEBUG=tlsmlkem=0
 
 EXPOSE 13339
 

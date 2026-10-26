@@ -433,6 +433,10 @@ func controlTransport(timeout time.Duration) *http.Transport {
 	return &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			MaxVersion:         tls.VersionTLS12,
+		},
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          8,
 		IdleConnTimeout:       30 * time.Second,
